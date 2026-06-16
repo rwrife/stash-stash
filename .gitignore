@@ -1,0 +1,20 @@
+# Binaries
+/stash-stash
+/bin/
+*.exe
+*.out
+dist/
+
+# Go
+*.test
+*.prof
+coverage.out
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# The tool's own sidecar (so we never commit a real one during dev)
+stash-stash.json
