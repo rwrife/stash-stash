@@ -38,10 +38,15 @@ go install github.com/rwrife/stash-stash/cmd/stash-stash@latest
 
 ## Usage
 
+> **v0.1 status (M1):** the binary currently builds, prints `--version`, and
+> reports a stub "no stashes found" message. The commands below are the target
+> v0.1 surface and land across [milestones M2–M6](https://github.com/rwrife/stash-stash/issues?q=label%3Amilestone).
+
 ```bash
-stash-stash                 # open the TUI over the current repo's stashes
-stash-stash push -m "label" # stash with a label that actually sticks
-stash-stash --stale-days 7  # flag anything older than a week
+stash-stash --version       # print the version (works today)
+stash-stash                 # open the TUI over the current repo's stashes (M3+)
+stash-stash push -m "label" # stash with a label that actually sticks (M5)
+stash-stash --stale-days 7  # flag anything older than a week (M6)
 ```
 
 ## How labels survive
