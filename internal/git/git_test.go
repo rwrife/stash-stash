@@ -107,3 +107,35 @@ func TestBranchFromSubject(t *testing.T) {
 		}
 	}
 }
+
+func TestShowReturnsPatch(t *testing.T) {
+	patch := "diff --git a/foo.txt b/foo.txt\n@@ -1 +1 @@\n-old\n+new\n"
+	stubRunner(t, patch, "", nil)
+
+	got, err := Show(context.Background(), "stash@{0}")
+	if err != nil {
+		t.Fatalf("Show() error = %v", err)
+	}
+	if got != patch {
+		t.Errorf("Show() = %q, want %q", got, patch)
+	}
+}
+
+func TestShowNotARepo(t *testing.T) {
+	stubRunner(t, "", "fatal: not a git repository (or any of the parent directories): .git", errors.New("exit status 128"))
+	_, err := Show(context.Background(), "stash@{0}")
+	if !errors.Is(err, ErrNotARepo) {
+		t.Fatalf("err = %v, want ErrNotARepo", err)
+	}
+}
+
+func TestShowGitError(t *testing.T) {
+	stubRunner(t, "", "fatal: bad revision 'stash@{9}'", errors.New("exit status 128"))
+	_, err := Show(context.Background(), "stash@{9}")
+	if err == nil {
+		t.Fatal("err = nil, want a git error")
+	}
+	if errors.Is(err, ErrNotARepo) {
+		t.Errorf("err = %v, want a generic git error, not ErrNotARepo", err)
+	}
+}

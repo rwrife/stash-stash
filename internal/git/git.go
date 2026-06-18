@@ -2,8 +2,8 @@
 //
 // stash-stash never links libgit2 or reimplements git semantics; it shells out
 // to `git` (inheriting the user's config and credentials) and parses the
-// output. M2 implements List(); mutating operations (apply/pop/drop/push)
-// arrive in M5.
+// output. M2 implements List() and M3 adds Show() (read-only); mutating
+// operations (apply/pop/drop/push) arrive in M5.
 package git
 
 import (
@@ -71,6 +71,26 @@ func List(ctx context.Context) ([]model.Stash, error) {
 	}
 
 	return parseList(stdout), nil
+}
+
+// Show returns the patch for a single stash as produced by
+// `git stash show -p <ref>` (e.g. ref "stash@{0}"). It is read-only and used
+// by the TUI preview pane (M3).
+//
+// Like List, it returns ErrNotARepo outside a work tree and surfaces git's own
+// error text otherwise. An empty (whitespace-only) diff yields an empty string.
+func Show(ctx context.Context, ref string) (string, error) {
+	stdout, stderr, err := runner(ctx, "stash", "show", "-p", ref)
+	if err != nil {
+		if isNotARepo(stderr) {
+			return "", ErrNotARepo
+		}
+		if msg := strings.TrimSpace(string(stderr)); msg != "" {
+			return "", fmt.Errorf("git stash show %s: %s", ref, msg)
+		}
+		return "", fmt.Errorf("git stash show %s: %w", ref, err)
+	}
+	return string(stdout), nil
 }
 
 // parseList turns the raw `git stash list --format` output into Stash structs.

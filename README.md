@@ -38,20 +38,36 @@ go install github.com/rwrife/stash-stash/cmd/stash-stash@latest
 
 ## Usage
 
-> **v0.1 status (M2):** the binary builds, prints `--version`, and now reads
-> your real stashes and prints them as a plain table (index · subject · age ·
-> branch). The interactive TUI and the rest of the surface below land across
-> [milestones M3–M6](https://github.com/rwrife/stash-stash/issues?q=label%3Amilestone).
+> **v0.1 status (M3):** the binary builds, prints `--version`, reads your real
+> stashes, and — when stdout is a terminal — opens an **interactive TUI**: a
+> scrollable list on the left and a live `git stash show -p` diff preview on the
+> right. Piped or non-TTY output (and `--no-tui`) still prints the plain M2
+> table, so scripts and CI keep working. Sidecar labels and mutating actions
+> land across [milestones M4–M6](https://github.com/rwrife/stash-stash/issues?q=label%3Amilestone).
 
 ```bash
 stash-stash --version       # print the version (works today)
-stash-stash                 # list the current repo's stashes as a table (works today, M2)
-stash-stash                 # …becomes an interactive TUI in M3+
+stash-stash                 # interactive TUI: browse stashes + preview diffs (works today, M3)
+stash-stash --no-tui        # force the plain table even on a TTY (works today)
+stash-stash | cat           # piped/non-TTY → plain table automatically
 stash-stash push -m "label" # stash with a label that actually sticks (M5)
 stash-stash --stale-days 7  # flag anything older than a week (M6)
 ```
 
-Today the plain listing looks like:
+### Interactive TUI (M3)
+
+Run `stash-stash` inside a repo with stashes and you get a two-pane browser:
+
+- **Left:** every stash with its `stash@{N}` ref, age, subject, and origin branch.
+- **Right:** the full unified diff (`git stash show -p`) for the selected stash,
+  lightly colorized and scrollable.
+
+Keys: `↑`/`↓` (or `j`/`k`) to select · `g`/`G` jump to top/bottom ·
+`⏎`/`space`/`PgDn` and `PgUp` to scroll the diff · `q` / `Ctrl-C` / `Esc` to quit.
+The layout is resize-aware. It's read-only — nothing is applied, popped, or
+dropped in M3.
+
+The plain (non-TTY / `--no-tui`) listing still looks like:
 
 ```
 INDEX      SUBJECT                        AGE  BRANCH
