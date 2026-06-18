@@ -38,15 +38,26 @@ go install github.com/rwrife/stash-stash/cmd/stash-stash@latest
 
 ## Usage
 
-> **v0.1 status (M1):** the binary currently builds, prints `--version`, and
-> reports a stub "no stashes found" message. The commands below are the target
-> v0.1 surface and land across [milestones M2–M6](https://github.com/rwrife/stash-stash/issues?q=label%3Amilestone).
+> **v0.1 status (M2):** the binary builds, prints `--version`, and now reads
+> your real stashes and prints them as a plain table (index · subject · age ·
+> branch). The interactive TUI and the rest of the surface below land across
+> [milestones M3–M6](https://github.com/rwrife/stash-stash/issues?q=label%3Amilestone).
 
 ```bash
 stash-stash --version       # print the version (works today)
-stash-stash                 # open the TUI over the current repo's stashes (M3+)
+stash-stash                 # list the current repo's stashes as a table (works today, M2)
+stash-stash                 # …becomes an interactive TUI in M3+
 stash-stash push -m "label" # stash with a label that actually sticks (M5)
 stash-stash --stale-days 7  # flag anything older than a week (M6)
+```
+
+Today the plain listing looks like:
+
+```
+INDEX      SUBJECT                        AGE  BRANCH
+stash@{0}  On main: new file work         2h   main
+stash@{1}  WIP on main: c533301 init      5d   main
+stash@{2}  On feature/x: half-done modal  23d  feature/x
 ```
 
 ## How labels survive
