@@ -2,8 +2,9 @@
 //
 // stash-stash never links libgit2 or reimplements git semantics; it shells out
 // to `git` (inheriting the user's config and credentials) and parses the
-// output. M2 implements List() and M3 adds Show() (read-only); mutating
-// operations (apply/pop/drop/push) arrive in M5.
+// output. M2 implements List(); M3 adds Show() (read-only); M4 adds Diffstat()
+// plus EnrichDiffstats(). Mutating operations (apply/pop/drop/push) arrive in
+// M5.
 package git
 
 import (
@@ -93,6 +94,58 @@ func Show(ctx context.Context, ref string) (string, error) {
 	return string(stdout), nil
 }
 
+// Diffstat returns the added/deleted/files summary for a single stash via
+// `git stash show --numstat <ref>` (M4). --numstat is stable, machine-parsable
+// output ("<added>\t<deleted>\t<path>" per file; binary files report "-\t-").
+//
+// Like Show it returns ErrNotARepo outside a work tree and surfaces git's own
+// error text otherwise. A stash that touches nothing yields a zero Diffstat.
+func Diffstat(ctx context.Context, ref string) (model.Diffstat, error) {
+	stdout, stderr, err := runner(ctx, "stash", "show", "--numstat", ref)
+	if err != nil {
+		if isNotARepo(stderr) {
+			return model.Diffstat{}, ErrNotARepo
+		}
+		if msg := strings.TrimSpace(string(stderr)); msg != "" {
+			return model.Diffstat{}, fmt.Errorf("git stash show --numstat %s: %s", ref, msg)
+		}
+		return model.Diffstat{}, fmt.Errorf("git stash show --numstat %s: %w", ref, err)
+	}
+	return parseNumstat(stdout), nil
+}
+
+// parseNumstat turns `git diff --numstat` style output into a Diffstat.
+// Each non-blank line is "<added>\t<deleted>\t<path>"; binary files use "-"
+// for the counts. Malformed lines are skipped defensively.
+func parseNumstat(out []byte) model.Diffstat {
+	var ds model.Diffstat
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		ds.Files++
+		addTok, delTok := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		if addTok == "-" || delTok == "-" {
+			ds.Binary = true
+			continue
+		}
+		if n, perr := strconv.Atoi(addTok); perr == nil {
+			ds.Added += n
+		}
+		if n, perr := strconv.Atoi(delTok); perr == nil {
+			ds.Deleted += n
+		}
+	}
+	return ds
+}
+
 // parseList turns the raw `git stash list --format` output into Stash structs.
 // Malformed or blank lines are skipped defensively rather than failing the
 // whole listing.
@@ -162,4 +215,22 @@ func isNotARepo(stderr []byte) bool {
 	msg := strings.ToLower(string(stderr))
 	return strings.Contains(msg, "not a git repository") ||
 		strings.Contains(msg, "this operation must be run in a work tree")
+}
+
+// EnrichDiffstats computes and attaches a Diffstat to each stash in place (M4).
+//
+// It runs one `git stash show --numstat` per stash. A per-stash failure is
+// non-fatal: that entry simply keeps a zero Diffstat so a single odd stash
+// can't blank out the whole list. An ErrNotARepo from the first call is
+// surfaced (the caller is outside a work tree); other errors are swallowed
+// per entry. Returns the (same, mutated) slice for convenience.
+func EnrichDiffstats(ctx context.Context, stashes []model.Stash) []model.Stash {
+	for i := range stashes {
+		ds, err := Diffstat(ctx, stashes[i].Ref())
+		if err != nil {
+			continue
+		}
+		stashes[i].Diffstat = ds
+	}
+	return stashes
 }

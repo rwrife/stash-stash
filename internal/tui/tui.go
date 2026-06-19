@@ -1,14 +1,16 @@
-// Package tui implements stash-stash's interactive Bubble Tea interface (M3):
-// a scrollable list of stashes on the left and a diff preview pane on the
-// right that renders `git stash show -p` for the selected stash.
+// Package tui implements stash-stash's interactive Bubble Tea interface: a
+// scrollable list of stashes on the left and a diff preview pane on the right
+// that renders `git stash show -p` for the selected stash.
 //
 // The model owns no git logic itself; it is handed a list of stashes and a
 // "show" function (so it stays unit-testable without a real repo). Selecting a
 // different stash kicks off an asynchronous load of its patch, keeping the UI
 // responsive on large diffs.
 //
-// Sidecar labels (M4) and mutating actions (M5) are intentionally out of scope
-// here — this milestone is read-only browsing.
+// M4 adds sidecar labels: each stash shows its stored label (or the raw git
+// subject) plus a diffstat, and `l` opens an inline editor to (re)label the
+// selected stash, persisted to `.git/stash-stash.json` by content SHA so the
+// label survives stash reordering. Mutating actions (M5) remain out of scope.
 package tui
 
 import (
@@ -17,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -28,6 +31,14 @@ import (
 // ShowFunc loads the patch for a stash ref (e.g. "stash@{0}"). It mirrors
 // git.Show but is injected so the model can be tested with a stub.
 type ShowFunc func(ctx context.Context, ref string) (string, error)
+
+// labeler is the subset of *meta.Store the TUI needs to persist relabels. An
+// interface keeps the model testable with an in-memory fake and lets a nil
+// store disable labeling gracefully.
+type labeler interface {
+	SetLabel(sha, label string)
+	Save() error
+}
 
 // Layout constants. The list pane is a fixed fraction of the width; the
 // preview takes the rest. A minimum keeps things sane on tiny terminals.
@@ -65,6 +76,16 @@ var (
 	helpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(0, 1)
 
 	errStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
+
+	// labelStyle highlights a stored sidecar label so it reads as a real name
+	// rather than the raw git subject.
+	labelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("222"))
+
+	// statStyle dims the diffstat token in the list.
+	statStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("108"))
+
+	// editPromptStyle frames the inline label editor row.
+	editPromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Padding(0, 1)
 )
 
 // diffLoadedMsg carries the result of an asynchronous git.Show for a stash.
@@ -99,15 +120,23 @@ type Model struct {
 	currentDiff string // raw patch for loadedFor
 	loading     bool
 	loadErr     error
+
+	// --- M4 labeling ---
+	store   labeler         // sidecar persistence; nil disables labeling
+	editing bool            // true while the inline label editor is open
+	input   textinput.Model // the label text field (valid while editing)
+	notice  string          // transient status line (e.g. "saved"/error)
 }
 
-// New builds a Model over the given stashes, using show to fetch diffs and now
-// to compute ages. The caller is responsible for the empty-stash and
-// not-a-repo cases before reaching the TUI.
-func New(stashes []model.Stash, show ShowFunc, now time.Time) Model {
+// New builds a Model over the given stashes, using show to fetch diffs, store
+// to persist relabels (may be nil to disable labeling), and now to compute
+// ages. The caller is responsible for the empty-stash and not-a-repo cases
+// before reaching the TUI.
+func New(stashes []model.Stash, show ShowFunc, store labeler, now time.Time) Model {
 	return Model{
 		stashes:   stashes,
 		show:      show,
+		store:     store,
 		now:       now,
 		loadedFor: -1,
 	}
@@ -173,8 +202,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// handleKey processes key presses: navigation, scrolling, and quit.
+// handleKey processes key presses: navigation, scrolling, labeling, and quit.
+// While the inline label editor is open, keys are routed to it instead.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.editing {
+		return m.handleEditKey(msg)
+	}
+
 	switch msg.String() {
 	case "q", "ctrl+c", "esc":
 		return m, tea.Quit
@@ -188,6 +222,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "end", "G":
 		return m.moveCursorTo(len(m.stashes) - 1)
 
+	case "l":
+		return m.beginEdit()
+
 	// Preview-pane scrolling.
 	case "pgup", "ctrl+b":
 		m.viewport.HalfViewUp()
@@ -200,6 +237,73 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.viewport, cmd = m.viewport.Update(msg)
 	return m, cmd
+}
+
+// beginEdit opens the inline label editor for the selected stash, seeding it
+// with the current label (empty for an unlabeled stash). It is a no-op when
+// labeling is disabled (no store) or there is no selection.
+func (m Model) beginEdit() (tea.Model, tea.Cmd) {
+	if m.store == nil || len(m.stashes) == 0 {
+		m.notice = "labeling unavailable (no sidecar)"
+		return m, nil
+	}
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.CharLimit = 120
+	ti.SetValue(m.stashes[m.cursor].Label)
+	ti.CursorEnd()
+	// Width is set to the list inner width minus the prompt label in View;
+	// a sane default keeps it usable before the first resize.
+	ti.Width = m.listInnerW
+	if ti.Width < 8 {
+		ti.Width = 8
+	}
+	ti.Focus()
+	m.input = ti
+	m.editing = true
+	m.notice = ""
+	return m, textinput.Blink
+}
+
+// handleEditKey drives the inline label editor: Enter commits, Esc cancels,
+// everything else edits the text field.
+func (m Model) handleEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		return m.commitEdit()
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.editing = false
+		m.notice = "label edit cancelled"
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+// commitEdit persists the edited label to the sidecar (keyed by the stash's
+// content SHA) and updates the in-memory stash so the list reflects it
+// immediately. Trimming to empty clears the label. Save failures surface in
+// the notice line but never crash the TUI.
+func (m Model) commitEdit() (tea.Model, tea.Cmd) {
+	m.editing = false
+	if len(m.stashes) == 0 || m.store == nil {
+		return m, nil
+	}
+	label := strings.TrimSpace(m.input.Value())
+	sha := m.stashes[m.cursor].SHA
+	m.store.SetLabel(sha, label)
+	m.stashes[m.cursor].Label = label
+	if err := m.store.Save(); err != nil {
+		m.notice = "save failed: " + err.Error()
+		return m, nil
+	}
+	if label == "" {
+		m.notice = "label cleared"
+	} else {
+		m.notice = "label saved"
+	}
+	return m, nil
 }
 
 // moveCursor moves the selection by delta and (if it changed) loads the new
@@ -294,9 +398,24 @@ func (m Model) View() string {
 
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, list, strings.Repeat(" ", gutter), preview)
 
-	help := helpStyle.Render("↑/↓ select · ⏎/space scroll · g/G top/bottom · q quit")
+	return lipgloss.JoinVertical(lipgloss.Left, title, panes, m.footer())
+}
 
-	return lipgloss.JoinVertical(lipgloss.Left, title, panes, help)
+// footer renders the bottom line of the UI: either the inline label editor
+// (while editing), a transient notice, or the key help.
+func (m Model) footer() string {
+	if m.editing {
+		label := "label"
+		if m.cursor >= 0 && m.cursor < len(m.stashes) {
+			label = "label " + m.stashes[m.cursor].Ref()
+		}
+		return editPromptStyle.Render(label+": ") + m.input.View() +
+			helpStyle.Render("  ⏎ save · esc cancel")
+	}
+	if m.notice != "" {
+		return helpStyle.Render(m.notice)
+	}
+	return helpStyle.Render("↑/↓ select · l label · ⏎/space scroll · g/G top/bottom · q quit")
 }
 
 // renderList draws the stash rows, highlighting the cursor row.
@@ -317,6 +436,8 @@ func (m Model) renderList() string {
 }
 
 // formatRow renders a single stash list entry, sized to the list pane width.
+// Line 1: ref + age + diffstat. Line 2: the label (highlighted) or raw
+// subject. Line 3: the origin branch.
 func (m Model) formatRow(s model.Stash) string {
 	branch := s.Branch
 	if branch == "" {
@@ -324,10 +445,21 @@ func (m Model) formatRow(s model.Stash) string {
 	}
 	ageTok := age.Humanize(s.Created, m.now)
 
-	// First line: the ref + age; second line: a truncated subject. Two lines
-	// per item keeps long subjects readable in a narrow column.
+	// First line: ref + age, plus the diffstat when there is one. Keeps the
+	// most-skimmable facts together.
 	head := fmt.Sprintf("%s  %s", s.Ref(), dimStyle.Render(ageTok))
-	subj := truncate(s.Subject, m.listInnerW)
+	if stat := s.Diffstat.String(); stat != "" {
+		head += "  " + statStyle.Render(stat)
+	}
+
+	// Second line: the human label if present (highlighted), else the raw
+	// git subject.
+	var subj string
+	if s.Label != "" {
+		subj = labelStyle.Render(truncate(s.Label, m.listInnerW))
+	} else {
+		subj = truncate(s.Subject, m.listInnerW)
+	}
 	br := branchStyle.Render(truncate("⎇ "+branch, m.listInnerW))
 
 	return head + "\n" + subj + "\n" + br
