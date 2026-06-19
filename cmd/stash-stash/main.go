@@ -1,8 +1,9 @@
 // Command stash-stash is a concierge for your git stash graveyard.
 //
-// M2: it reads real stashes via `git stash list` and prints a plain,
-// non-interactive table (index | subject | age | branch). The Bubble Tea TUI,
-// sidecar labels, and mutating actions arrive in later milestones (see PLAN.md).
+// M3: when stdout is a TTY it reads real stashes and opens an interactive
+// Bubble Tea browser (scrollable list + diff preview); otherwise it prints the
+// plain, non-interactive table from M2 so pipes and CI stay script-friendly.
+// Sidecar labels and mutating actions arrive in later milestones (see PLAN.md).
 package main
 
 import (
@@ -14,8 +15,11 @@ import (
 	"os"
 	"time"
 
+	"golang.org/x/term"
+
 	"github.com/rwrife/stash-stash/internal/git"
 	"github.com/rwrife/stash-stash/internal/render"
+	"github.com/rwrife/stash-stash/internal/tui"
 )
 
 // version is the build version. It is overridable at build time via:
@@ -25,6 +29,17 @@ var version = "dev"
 
 // now is indirected so tests can pin the clock when checking age output.
 var now = time.Now
+
+// stdoutIsTTY reports whether standard output is an interactive terminal. It
+// is a package var so tests can force the plain-table path. The real check
+// uses the actual os.Stdout file descriptor.
+var stdoutIsTTY = func() bool {
+	return term.IsTerminal(int(os.Stdout.Fd()))
+}
+
+// noTUI lets `--no-tui` (or a non-TTY stdout) force the plain table even in an
+// interactive shell, which is handy for screenshots, logs, and scripting.
+var noTUIFlag bool
 
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
@@ -42,6 +57,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	showVersion := fs.Bool("version", false, "print version and exit")
+	fs.BoolVar(&noTUIFlag, "no-tui", false, "force plain table output even on a TTY")
 
 	if err := fs.Parse(args); err != nil {
 		// flag already printed the error + usage; -h/--help returns ErrHelp.
@@ -56,13 +72,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	return list(stdout, stderr)
+	return listOrBrowse(stdout, stderr)
 }
 
-// list reads the current repo's stashes and prints them as a table. It returns
-// the process exit code: 0 on success (including the no-stash case), 1 on a
-// real error talking to git.
-func list(stdout, stderr io.Writer) int {
+// listOrBrowse loads the current repo's stashes and either opens the
+// interactive TUI (TTY stdout, not --no-tui) or prints the plain table. It
+// returns the process exit code: 0 on success (including the no-stash case),
+// 1 on a real error talking to git, 1 on a TUI runtime failure.
+func listOrBrowse(stdout, stderr io.Writer) int {
 	ctx := context.Background()
 
 	stashes, err := git.List(ctx)
@@ -77,6 +94,16 @@ func list(stdout, stderr io.Writer) int {
 
 	if len(stashes) == 0 {
 		fmt.Fprintln(stdout, "No stashes found. Your graveyard is empty — nice. 🪦")
+		return 0
+	}
+
+	// Interactive path: only when we have a real terminal and the user didn't
+	// opt out. Everything else (pipes, CI, --no-tui) gets the plain table.
+	if !noTUIFlag && stdout == os.Stdout && stdoutIsTTY() {
+		if err := tui.Run(stashes, git.Show, now(), os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintf(stderr, "stash-stash: tui: %v\n", err)
+			return 1
+		}
 		return 0
 	}
 
