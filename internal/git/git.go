@@ -3,8 +3,10 @@
 // stash-stash never links libgit2 or reimplements git semantics; it shells out
 // to `git` (inheriting the user's config and credentials) and parses the
 // output. M2 implements List(); M3 adds Show() (read-only); M4 adds Diffstat()
-// plus EnrichDiffstats(). Mutating operations (apply/pop/drop/push) arrive in
-// M5.
+// plus EnrichDiffstats(). M5 adds the mutating operations Apply, Pop, Drop, and
+// Push — each kept thin (shell out, parse, surface git's own errors) and, for
+// the TUI's sake, returning enough information (e.g. the new stash SHA on Push)
+// to keep the sidecar metadata coherent.
 package git
 
 import (
@@ -215,6 +217,124 @@ func isNotARepo(stderr []byte) bool {
 	msg := strings.ToLower(string(stderr))
 	return strings.Contains(msg, "not a git repository") ||
 		strings.Contains(msg, "this operation must be run in a work tree")
+}
+
+// Apply applies a stash onto the working tree via `git stash apply <ref>`,
+// leaving the stash in the stack (M5). It is the non-destructive cousin of
+// Pop: callers that want the entry gone afterwards use Pop instead.
+//
+// It returns ErrNotARepo outside a work tree and surfaces git's own error text
+// otherwise — most importantly merge conflicts, which exit non-zero. Callers
+// should present that message verbatim so the user can resolve it.
+func Apply(ctx context.Context, ref string) error {
+	return runMutation(ctx, fmt.Sprintf("git stash apply %s", ref), "stash", "apply", ref)
+}
+
+// Pop applies a stash and then drops it via `git stash pop <ref>` (M5). This is
+// destructive in the sense that the stash entry is removed — but only once git
+// successfully applies it. If the apply conflicts, git leaves the stash in
+// place and exits non-zero; we surface that error so the caller can warn and
+// the sidecar entry is preserved.
+func Pop(ctx context.Context, ref string) error {
+	return runMutation(ctx, fmt.Sprintf("git stash pop %s", ref), "stash", "pop", ref)
+}
+
+// Drop deletes a stash without applying it via `git stash drop <ref>` (M5).
+// This permanently removes the entry (recoverable only via reflog), so the TUI
+// must gate it behind an explicit confirm before calling here.
+//
+// It returns ErrNotARepo outside a work tree and surfaces git's own error text
+// otherwise.
+func Drop(ctx context.Context, ref string) error {
+	return runMutation(ctx, fmt.Sprintf("git stash drop %s", ref), "stash", "drop", ref)
+}
+
+// Push stashes the current working-tree changes via `git stash push -m <msg>`
+// and returns the content SHA of the newly-created stash (always stash@{0}
+// immediately after a successful push), so the caller can record the label in
+// the sidecar keyed by that SHA (M5).
+//
+// A message is optional: an empty msg runs a plain `git stash push`, letting
+// git pick its default "WIP on <branch>" subject. When there is nothing to
+// stash git prints "No local changes to save" and exits zero with no new
+// stash; Push detects that and returns ErrNothingToStash so callers can report
+// it cleanly rather than recording a label against a stash that doesn't exist.
+func Push(ctx context.Context, msg string) (string, error) {
+	args := []string{"stash", "push"}
+	if strings.TrimSpace(msg) != "" {
+		args = append(args, "-m", msg)
+	}
+	stdout, stderr, err := runner(ctx, args...)
+	if err != nil {
+		if isNotARepo(stderr) {
+			return "", ErrNotARepo
+		}
+		if m := strings.TrimSpace(string(stderr)); m != "" {
+			return "", fmt.Errorf("git stash push: %s", m)
+		}
+		return "", fmt.Errorf("git stash push: %w", err)
+	}
+
+	// git prints "No local changes to save" (to stdout) and creates nothing.
+	if noChangesToStash(stdout) {
+		return "", ErrNothingToStash
+	}
+
+	// Read back the SHA of the stash we just created. It is always stash@{0}
+	// right after a successful push.
+	sha, serr := resolveStashSHA(ctx, "stash@{0}")
+	if serr != nil {
+		// The stash exists; we just couldn't resolve its SHA. Treat as a soft
+		// failure so the caller knows the push happened but labeling can't be
+		// keyed reliably.
+		return "", fmt.Errorf("stash created but could not resolve its SHA: %w", serr)
+	}
+	return sha, nil
+}
+
+// ErrNothingToStash is returned by Push when the working tree is clean and git
+// creates no stash. It is an expected, friendly condition.
+var ErrNothingToStash = errors.New("no local changes to stash")
+
+// runMutation runs a mutating git invocation, mapping a not-a-repo stderr to
+// ErrNotARepo and otherwise wrapping git's own error text under the supplied
+// human label (e.g. "git stash drop stash@{1}"). Stdout is ignored: these
+// operations are run for effect.
+func runMutation(ctx context.Context, label string, args ...string) error {
+	_, stderr, err := runner(ctx, args...)
+	if err != nil {
+		if isNotARepo(stderr) {
+			return ErrNotARepo
+		}
+		if m := strings.TrimSpace(string(stderr)); m != "" {
+			return fmt.Errorf("%s: %s", label, m)
+		}
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	return nil
+}
+
+// resolveStashSHA returns the full commit SHA for a stash ref via
+// `git rev-parse <ref>`. Used by Push to key sidecar labels by content SHA.
+func resolveStashSHA(ctx context.Context, ref string) (string, error) {
+	stdout, stderr, err := runner(ctx, "rev-parse", ref)
+	if err != nil {
+		if msg := strings.TrimSpace(string(stderr)); msg != "" {
+			return "", fmt.Errorf("git rev-parse %s: %s", ref, msg)
+		}
+		return "", fmt.Errorf("git rev-parse %s: %w", ref, err)
+	}
+	sha := strings.TrimSpace(string(stdout))
+	if sha == "" {
+		return "", fmt.Errorf("git rev-parse %s: empty output", ref)
+	}
+	return sha, nil
+}
+
+// noChangesToStash reports whether `git stash push` declined to create a stash
+// because the working tree was clean. git emits this on stdout.
+func noChangesToStash(stdout []byte) bool {
+	return strings.Contains(strings.ToLower(string(stdout)), "no local changes to save")
 }
 
 // EnrichDiffstats computes and attaches a Diffstat to each stash in place (M4).

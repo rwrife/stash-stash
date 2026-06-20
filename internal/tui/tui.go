@@ -10,7 +10,14 @@
 // M4 adds sidecar labels: each stash shows its stored label (or the raw git
 // subject) plus a diffstat, and `l` opens an inline editor to (re)label the
 // selected stash, persisted to `.git/stash-stash.json` by content SHA so the
-// label survives stash reordering. Mutating actions (M5) remain out of scope.
+// label survives stash reordering.
+//
+// M5 adds mutating actions: `a` applies the selected stash (non-destructive),
+// `p` pops it, and `d` drops it. Because pop and drop destroy or move work,
+// they are gated behind a y/n confirm prompt; apply runs immediately. After a
+// successful mutation the list is reloaded from git (indices shift) and the
+// sidecar entry for a removed stash is pruned, so the metadata never drifts
+// from reality. Every action lands a transient success/error toast.
 package tui
 
 import (
@@ -18,6 +25,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -32,12 +40,40 @@ import (
 // git.Show but is injected so the model can be tested with a stub.
 type ShowFunc func(ctx context.Context, ref string) (string, error)
 
-// labeler is the subset of *meta.Store the TUI needs to persist relabels. An
-// interface keeps the model testable with an in-memory fake and lets a nil
-// store disable labeling gracefully.
+// ActionFunc performs a mutating git operation on a stash ref (apply/pop/drop).
+// It mirrors git.Apply/Pop/Drop and is injected so the model is testable
+// without a real repo.
+type ActionFunc func(ctx context.Context, ref string) error
+
+// ReloadFunc returns the current, freshly-enriched stash list (labels +
+// diffstats applied), used after a pop/drop to resync the view with git since
+// stash@{N} indices shift. It mirrors the load path in main and is injected so
+// the model can be tested deterministically.
+type ReloadFunc func(ctx context.Context) ([]model.Stash, error)
+
+// Actions bundles the mutating operations the TUI can perform. A zero Actions
+// (all-nil funcs) cleanly disables the action keys (they report "unavailable"),
+// which is handy in tests and non-mutating contexts.
+type Actions struct {
+	Apply  ActionFunc
+	Pop    ActionFunc
+	Drop   ActionFunc
+	Reload ReloadFunc
+}
+
+// labeler is the subset of *meta.Store the TUI needs to persist relabels and
+// prune removed stashes. An interface keeps the model testable with an
+// in-memory fake and lets a nil store disable labeling gracefully.
 type labeler interface {
 	SetLabel(sha, label string)
 	Save() error
+}
+
+// pruner is the optional subset of *meta.Store used to drop the sidecar entry
+// for a stash removed by pop/drop, keyed by content SHA. *meta.Store satisfies
+// it via Prune; the TUI feeds Prune the set of still-live SHAs.
+type pruner interface {
+	Prune(liveSHAs map[string]struct{}) int
 }
 
 // Layout constants. The list pane is a fixed fraction of the width; the
@@ -86,6 +122,10 @@ var (
 
 	// editPromptStyle frames the inline label editor row.
 	editPromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Padding(0, 1)
+
+	// confirmStyle frames the destructive-action y/N prompt so it reads as a
+	// warning, not a casual hint.
+	confirmStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203")).Padding(0, 1)
 )
 
 // diffLoadedMsg carries the result of an asynchronous git.Show for a stash.
@@ -95,6 +135,76 @@ type diffLoadedMsg struct {
 	index int
 	diff  string
 	err   error
+}
+
+// actionKind identifies which mutating action an actionDoneMsg refers to, so
+// the toast can name it ("applied"/"popped"/"dropped").
+type actionKind int
+
+const (
+	actionApply actionKind = iota
+	actionPop
+	actionDrop
+)
+
+func (a actionKind) verb() string {
+	switch a {
+	case actionApply:
+		return "applied"
+	case actionPop:
+		return "popped"
+	case actionDrop:
+		return "dropped"
+	default:
+		return "done"
+	}
+}
+
+// imperative returns the present-tense command word for prompts ("apply",
+// "pop", "drop").
+func (a actionKind) imperative() string {
+	switch a {
+	case actionApply:
+		return "apply"
+	case actionPop:
+		return "pop"
+	case actionDrop:
+		return "drop"
+	default:
+		return "act on"
+	}
+}
+
+// consequence is a short, honest description of what a destructive action does,
+// shown in the confirm prompt so the user knows the stakes.
+func (a actionKind) consequence() string {
+	switch a {
+	case actionPop:
+		return "applies then removes it from the stack"
+	case actionDrop:
+		return "deletes it (recoverable only via reflog)"
+	default:
+		return ""
+	}
+}
+
+// destructive reports whether the action removes/moves work and therefore
+// needs a confirm prompt (pop and drop) versus running immediately (apply).
+func (a actionKind) destructive() bool { return a == actionPop || a == actionDrop }
+
+// actionDoneMsg carries the result of a mutating git op plus the context
+// needed to update the view: which stash (by SHA, since the index it had may
+// now be invalid) and a freshly-reloaded stash list when the mutation
+// succeeded (nil on error). reloadErr is set if the post-mutation reload
+// itself failed even though the mutation succeeded.
+type actionDoneMsg struct {
+	kind      actionKind
+	sha       string
+	ref       string
+	err       error
+	reloaded  []model.Stash
+	reloadErr error
+	didMutate bool // the git op succeeded (so the stash set changed)
 }
 
 // Model is the Bubble Tea model for the stash browser.
@@ -126,17 +236,25 @@ type Model struct {
 	editing bool            // true while the inline label editor is open
 	input   textinput.Model // the label text field (valid while editing)
 	notice  string          // transient status line (e.g. "saved"/error)
+
+	// --- M5 actions ---
+	actions    Actions    // mutating ops (apply/pop/drop) + reload; zero disables
+	confirming bool       // true while a y/n destructive-action prompt is open
+	pending    actionKind // which destructive action awaits confirmation
+	busy       bool       // true while a mutating op is in flight (input locked)
 }
 
 // New builds a Model over the given stashes, using show to fetch diffs, store
-// to persist relabels (may be nil to disable labeling), and now to compute
-// ages. The caller is responsible for the empty-stash and not-a-repo cases
-// before reaching the TUI.
-func New(stashes []model.Stash, show ShowFunc, store labeler, now time.Time) Model {
+// to persist relabels (may be nil to disable labeling), actions to perform the
+// mutating apply/pop/drop operations (a zero Actions disables them), and now to
+// compute ages. The caller is responsible for the empty-stash and not-a-repo
+// cases before reaching the TUI.
+func New(stashes []model.Stash, show ShowFunc, store labeler, actions Actions, now time.Time) Model {
 	return Model{
 		stashes:   stashes,
 		show:      show,
 		store:     store,
+		actions:   actions,
 		now:       now,
 		loadedFor: -1,
 	}
@@ -194,6 +312,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.SetContent(m.renderDiff())
 		m.viewport.GotoTop()
 		return m, nil
+
+	case actionDoneMsg:
+		return m.handleActionDone(msg)
 	}
 
 	// Forward anything else (e.g. mouse) to the viewport for scrolling.
@@ -202,11 +323,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// handleKey processes key presses: navigation, scrolling, labeling, and quit.
-// While the inline label editor is open, keys are routed to it instead.
+// handleKey processes key presses: navigation, scrolling, labeling, actions,
+// and quit. While the inline label editor or a confirm prompt is open, keys are
+// routed there instead; while a mutation is in flight the UI is input-locked
+// except for quit.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.editing {
 		return m.handleEditKey(msg)
+	}
+	if m.confirming {
+		return m.handleConfirmKey(msg)
+	}
+	if m.busy {
+		// Allow only a hard quit while an action is running.
+		switch msg.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		}
+		return m, nil
 	}
 
 	switch msg.String() {
@@ -224,6 +358,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "l":
 		return m.beginEdit()
+
+	case "a":
+		return m.startAction(actionApply)
+	case "p":
+		return m.startAction(actionPop)
+	case "d":
+		return m.startAction(actionDrop)
 
 	// Preview-pane scrolling.
 	case "pgup", "ctrl+b":
@@ -309,7 +450,169 @@ func (m Model) commitEdit() (tea.Model, tea.Cmd) {
 // moveCursor moves the selection by delta and (if it changed) loads the new
 // stash's diff.
 func (m Model) moveCursor(delta int) (tea.Model, tea.Cmd) {
+
 	return m.moveCursorTo(m.cursor + delta)
+}
+
+// startAction begins a mutating action on the selected stash. Apply runs
+// immediately (non-destructive); pop and drop open a y/n confirm prompt first.
+// It is a no-op (with an explanatory toast) when the action is unavailable
+// (no injected func) or there is no selection.
+func (m Model) startAction(kind actionKind) (tea.Model, tea.Cmd) {
+	if len(m.stashes) == 0 {
+		return m, nil
+	}
+	if m.actionFunc(kind) == nil {
+		m.notice = kind.verb() + ": unavailable"
+		return m, nil
+	}
+	m.notice = ""
+	if kind.destructive() {
+		m.confirming = true
+		m.pending = kind
+		return m, nil
+	}
+	return m.fireAction(kind)
+}
+
+// actionFunc returns the injected func for a kind, or nil if unavailable.
+func (m Model) actionFunc(kind actionKind) ActionFunc {
+	switch kind {
+	case actionApply:
+		return m.actions.Apply
+	case actionPop:
+		return m.actions.Pop
+	case actionDrop:
+		return m.actions.Drop
+	default:
+		return nil
+	}
+}
+
+// handleConfirmKey drives the destructive-action confirm prompt: 'y' fires the
+// pending action, anything else (n/esc/q/…) cancels it.
+func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch strings.ToLower(msg.String()) {
+	case "y":
+		kind := m.pending
+		m.confirming = false
+		return m.fireAction(kind)
+	default:
+		m.confirming = false
+		m.notice = m.pending.verb() + " cancelled"
+		return m, nil
+	}
+}
+
+// fireAction locks the UI and dispatches the async command that runs the git
+// op against the selected stash. The captured ref/SHA travel with the result
+// so the post-mutation handler can act even though indices may shift.
+func (m Model) fireAction(kind actionKind) (tea.Model, tea.Cmd) {
+	if len(m.stashes) == 0 {
+		return m, nil
+	}
+	s := m.stashes[m.cursor]
+	m.busy = true
+	m.notice = capitalize(m.gerund(kind)) + " " + s.Ref() + "…"
+	return m, m.runActionCmd(kind, s.Ref(), s.SHA)
+}
+
+// gerund returns the "-ing" form of an action for the in-flight toast.
+func (m Model) gerund(kind actionKind) string {
+	switch kind {
+	case actionApply:
+		return "applying"
+	case actionPop:
+		return "popping"
+	case actionDrop:
+		return "dropping"
+	default:
+		return "working"
+	}
+}
+
+// runActionCmd returns a command that performs the mutating git op and, on
+// success for a pop/drop, reloads the stash list so indices resync. Apply does
+// not change the stash set, so it skips the reload.
+func (m Model) runActionCmd(kind actionKind, ref, sha string) tea.Cmd {
+	fn := m.actionFunc(kind)
+	reload := m.actions.Reload
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := fn(ctx, ref); err != nil {
+			return actionDoneMsg{kind: kind, sha: sha, ref: ref, err: err}
+		}
+		res := actionDoneMsg{kind: kind, sha: sha, ref: ref, didMutate: true}
+		// Apply leaves the stack unchanged; only pop/drop need a resync.
+		if kind.destructive() && reload != nil {
+			stashes, rerr := reload(ctx)
+			res.reloaded = stashes
+			res.reloadErr = rerr
+		}
+		return res
+	}
+}
+
+// handleActionDone applies the result of a mutating op: it sets the toast,
+// and for a successful pop/drop swaps in the reloaded stash list, prunes the
+// sidecar entry for the removed stash, clamps the cursor, and reloads the
+// preview for the newly-selected stash.
+func (m Model) handleActionDone(msg actionDoneMsg) (tea.Model, tea.Cmd) {
+	m.busy = false
+
+	if msg.err != nil {
+		m.notice = msg.ref + ": " + condense(msg.err.Error())
+		return m, nil
+	}
+
+	// Apply succeeded: the stack is unchanged, just confirm via toast.
+	if !msg.kind.destructive() {
+		m.notice = msg.ref + " " + msg.kind.verb()
+		return m, nil
+	}
+
+	// Pop/drop succeeded. Prune the sidecar entry for the removed stash so its
+	// label doesn't linger, then resync the list from the reload.
+	if p, ok := m.store.(pruner); ok && msg.sha != "" {
+		live := map[string]struct{}{}
+		for _, s := range msg.reloaded {
+			live[s.SHA] = struct{}{}
+		}
+		if n := p.Prune(live); n > 0 {
+			_ = m.store.Save() // best-effort; a sidecar write error must not crash
+		}
+	}
+
+	if msg.reloadErr != nil {
+		// The git op worked but we couldn't re-list. Tell the user; the next
+		// launch will resync. Keep the (now stale) list rather than blanking.
+		m.notice = msg.ref + " " + msg.kind.verb() + " (reload failed: " + condense(msg.reloadErr.Error()) + ")"
+		return m, nil
+	}
+
+	m.stashes = msg.reloaded
+	m.notice = msg.ref + " " + msg.kind.verb()
+
+	// No stashes left: nothing more to preview. The View renders an empty
+	// state; quitting is up to the user.
+	if len(m.stashes) == 0 {
+		m.cursor = 0
+		m.loadedFor = -1
+		m.currentDiff = ""
+		m.viewport.SetContent(dimStyle.Render("No stashes left — graveyard cleared. 🪦"))
+		return m, nil
+	}
+
+	// Clamp the cursor (the list likely shrank) and reload that stash's diff.
+	if m.cursor > len(m.stashes)-1 {
+		m.cursor = len(m.stashes) - 1
+	}
+	m.loadedFor = -1
+	m.loading = true
+	m.viewport.SetContent(dimStyle.Render("Loading diff…"))
+	m.viewport.GotoTop()
+	return m, m.loadDiffCmd(m.cursor)
 }
 
 // moveCursorTo clamps to a valid row and triggers a diff load when the
@@ -401,8 +704,9 @@ func (m Model) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, title, panes, m.footer())
 }
 
-// footer renders the bottom line of the UI: either the inline label editor
-// (while editing), a transient notice, or the key help.
+// footer renders the bottom line of the UI: the inline label editor (while
+// editing), a destructive-action confirm prompt (while confirming), a transient
+// notice, or the key help.
 func (m Model) footer() string {
 	if m.editing {
 		label := "label"
@@ -412,10 +716,18 @@ func (m Model) footer() string {
 		return editPromptStyle.Render(label+": ") + m.input.View() +
 			helpStyle.Render("  ⏎ save · esc cancel")
 	}
+	if m.confirming {
+		ref := ""
+		if m.cursor >= 0 && m.cursor < len(m.stashes) {
+			ref = " " + m.stashes[m.cursor].Ref()
+		}
+		return confirmStyle.Render(fmt.Sprintf("%s%s? %s — (y/N)",
+			capitalize(m.pending.imperative()), ref, m.pending.consequence()))
+	}
 	if m.notice != "" {
 		return helpStyle.Render(m.notice)
 	}
-	return helpStyle.Render("↑/↓ select · l label · ⏎/space scroll · g/G top/bottom · q quit")
+	return helpStyle.Render("↑/↓ select · l label · a apply · p pop · d drop · ⏎/space scroll · q quit")
 }
 
 // renderList draws the stash rows, highlighting the cursor row.
@@ -490,4 +802,23 @@ func plural(n int, one, many string) string {
 		return one
 	}
 	return many
+}
+
+// condense flattens a multi-line error message (git loves these) into a single
+// space-joined line and trims it so a toast stays on one row. It keeps the
+// message honest — we don't drop the text, just reflow it.
+func condense(s string) string {
+	fields := strings.Fields(s)
+	return strings.Join(fields, " ")
+}
+
+// capitalize upper-cases the first rune of s (ASCII-focused; our callers pass
+// plain lowercase verbs). Avoids the deprecated strings.Title.
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	r := []rune(s)
+	r[0] = unicode.ToUpper(r[0])
+	return string(r)
 }

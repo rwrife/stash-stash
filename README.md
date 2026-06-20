@@ -38,21 +38,25 @@ go install github.com/rwrife/stash-stash/cmd/stash-stash@latest
 
 ## Usage
 
-> **v0.1 status (M4):** the binary reads your real stashes and — when stdout is
+> **v0.1 status (M5):** the binary reads your real stashes and — when stdout is
 > a terminal — opens an **interactive TUI**: a scrollable list on the left and a
 > live `git stash show -p` diff preview on the right. Each stash shows its
 > **sidecar label** (or the raw git subject) plus a **diffstat**, and `l`
 > (re)labels the selected stash; labels are keyed by content SHA so they survive
-> pop/push reordering. Piped or non-TTY output (and `--no-tui`) prints the plain
-> table, so scripts and CI keep working. Mutating actions and the staleness nag
-> land in [M5–M6](https://github.com/rwrife/stash-stash/issues?q=label%3Amilestone).
+> pop/push reordering. **You can now act on stashes**: `a` applies, `p` pops,
+> and `d` drops the selected stash — pop and drop ask for a `y/N` confirm first,
+> and the sidecar is kept in sync on every mutation. `stash-stash push -m
+> "label"` stashes your working tree and records the label immediately. Piped or
+> non-TTY output (and `--no-tui`) prints the plain table, so scripts and CI keep
+> working. The staleness nag lands in
+> [M6](https://github.com/rwrife/stash-stash/issues?q=label%3Amilestone).
 
 ```bash
 stash-stash --version       # print the version (works today)
-stash-stash                 # interactive TUI: browse, preview diffs, (re)label (works today, M4)
+stash-stash                 # interactive TUI: browse, preview, (re)label, apply/pop/drop (works today, M5)
 stash-stash --no-tui        # force the plain table even on a TTY (works today)
 stash-stash | cat           # piped/non-TTY → plain table automatically
-stash-stash push -m "label" # stash with a label that actually sticks (M5)
+stash-stash push -m "label" # stash with a label that actually sticks (works today, M5)
 stash-stash --stale-days 7  # flag anything older than a week (M6)
 ```
 
@@ -67,10 +71,30 @@ Run `stash-stash` inside a repo with stashes and you get a two-pane browser:
   lightly colorized and scrollable.
 
 Keys: `↑`/`↓` (or `j`/`k`) to select · `g`/`G` jump to top/bottom · **`l` to
-(re)label** the selected stash (`⏎` saves, `esc` cancels) · `⏎`/`space`/`PgDn`
-and `PgUp` to scroll the diff · `q` / `Ctrl-C` / `Esc` to quit. The layout is
-resize-aware. Browsing and labeling are non-destructive — nothing is applied,
-popped, or dropped (that's M5).
+(re)label** the selected stash (`⏎` saves, `esc` cancels) · **`a` apply ·
+`p` pop · `d` drop** the selected stash · `⏎`/`space`/`PgDn` and `PgUp` to
+scroll the diff · `q` / `Ctrl-C` / `Esc` to quit. The layout is resize-aware.
+
+**Actions are safe by default.** `a` (apply) is non-destructive and runs
+immediately. `p` (pop) and `d` (drop) move or delete work, so they pop a
+`y/N` confirm first — nothing is removed without an explicit keypress. After a
+pop or drop the list resyncs with git and the sidecar entry for the removed
+stash is pruned, so labels never drift. Git's own errors (e.g. a conflicting
+apply) are surfaced verbatim in a status toast, and the stash is left in place
+so you can resolve it.
+
+### Stashing with a label that sticks
+
+```bash
+stash-stash push -m "payments: retry backoff"
+```
+
+This is a thin wrapper around `git stash push -m`: it stashes your working tree
+and, the instant the stash exists, records your label in the sidecar keyed by
+the new stash's content SHA. No more `WIP on main:` mystery subjects — the
+stash is named from birth. Run without `-m` and it behaves like a plain
+`git stash push` (git picks the default subject). If the tree is clean it says
+so and does nothing.
 
 The plain (non-TTY / `--no-tui`) listing shows the same enrichment:
 

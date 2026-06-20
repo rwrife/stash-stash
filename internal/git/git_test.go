@@ -3,6 +3,7 @@ package git
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/rwrife/stash-stash/internal/model"
@@ -215,5 +216,148 @@ func TestEnrichDiffstatsToleratesError(t *testing.T) {
 	EnrichDiffstats(context.Background(), stashes)
 	if !stashes[0].Diffstat.IsZero() {
 		t.Errorf("errored diffstat = %+v, want zero", stashes[0].Diffstat)
+	}
+}
+
+// --- M5: mutating operations ---------------------------------------------
+
+// stubRunnerFunc swaps the package runner for a fully custom function so tests
+// can vary behavior by git args (e.g. Push runs "stash push" then "rev-parse").
+func stubRunnerFunc(t *testing.T, fn func(args ...string) ([]byte, []byte, error)) {
+	t.Helper()
+	orig := runner
+	runner = func(ctx context.Context, args ...string) ([]byte, []byte, error) {
+		return fn(args...)
+	}
+	t.Cleanup(func() { runner = orig })
+}
+
+func TestApplyOK(t *testing.T) {
+	var gotArgs []string
+	stubRunnerFunc(t, func(args ...string) ([]byte, []byte, error) {
+		gotArgs = args
+		return nil, nil, nil
+	})
+	if err := Apply(context.Background(), "stash@{1}"); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	want := []string{"stash", "apply", "stash@{1}"}
+	if strings.Join(gotArgs, " ") != strings.Join(want, " ") {
+		t.Errorf("Apply args = %v, want %v", gotArgs, want)
+	}
+}
+
+func TestApplyConflictSurfacesGitError(t *testing.T) {
+	stubRunner(t, "", "CONFLICT (content): Merge conflict in foo.txt", errors.New("exit status 1"))
+	err := Apply(context.Background(), "stash@{0}")
+	if err == nil {
+		t.Fatal("Apply() = nil, want a conflict error")
+	}
+	if !strings.Contains(err.Error(), "CONFLICT") {
+		t.Errorf("Apply() error = %q, want it to mention the conflict", err)
+	}
+	if errors.Is(err, ErrNotARepo) {
+		t.Errorf("Apply() conflict misreported as ErrNotARepo")
+	}
+}
+
+func TestPopAndDropArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(context.Context, string) error
+		verb string
+	}{
+		{"pop", Pop, "pop"},
+		{"drop", Drop, "drop"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotArgs []string
+			stubRunnerFunc(t, func(args ...string) ([]byte, []byte, error) {
+				gotArgs = args
+				return nil, nil, nil
+			})
+			if err := tc.call(context.Background(), "stash@{2}"); err != nil {
+				t.Fatalf("%s() error = %v", tc.name, err)
+			}
+			want := "stash " + tc.verb + " stash@{2}"
+			if strings.Join(gotArgs, " ") != want {
+				t.Errorf("%s args = %v, want %q", tc.name, gotArgs, want)
+			}
+		})
+	}
+}
+
+func TestDropNotARepo(t *testing.T) {
+	stubRunner(t, "", "fatal: not a git repository (or any of the parent directories): .git", errors.New("exit status 128"))
+	if err := Drop(context.Background(), "stash@{0}"); !errors.Is(err, ErrNotARepo) {
+		t.Fatalf("Drop() err = %v, want ErrNotARepo", err)
+	}
+}
+
+func TestPushRecordsSHA(t *testing.T) {
+	var calls [][]string
+	stubRunnerFunc(t, func(args ...string) ([]byte, []byte, error) {
+		calls = append(calls, args)
+		switch {
+		case len(args) >= 2 && args[0] == "stash" && args[1] == "push":
+			return []byte("Saved working directory and index state On main: my label\n"), nil, nil
+		case len(args) >= 1 && args[0] == "rev-parse":
+			return []byte("abc123def456\n"), nil, nil
+		}
+		return nil, nil, errors.New("unexpected git call")
+	})
+
+	sha, err := Push(context.Background(), "my label")
+	if err != nil {
+		t.Fatalf("Push() error = %v", err)
+	}
+	if sha != "abc123def456" {
+		t.Errorf("Push() sha = %q, want abc123def456", sha)
+	}
+	// First call must include the -m label; second must resolve stash@{0}.
+	if len(calls) != 2 {
+		t.Fatalf("Push() made %d git calls, want 2 (push + rev-parse)", len(calls))
+	}
+	if strings.Join(calls[0], " ") != "stash push -m my label" {
+		t.Errorf("push call = %v, want it to carry -m my label", calls[0])
+	}
+	if calls[1][0] != "rev-parse" || calls[1][1] != "stash@{0}" {
+		t.Errorf("readback call = %v, want rev-parse stash@{0}", calls[1])
+	}
+}
+
+func TestPushNoMessageSkipsDashM(t *testing.T) {
+	var pushArgs []string
+	stubRunnerFunc(t, func(args ...string) ([]byte, []byte, error) {
+		if args[0] == "stash" {
+			pushArgs = args
+			return []byte("Saved working directory\n"), nil, nil
+		}
+		return []byte("deadbeef\n"), nil, nil
+	})
+	if _, err := Push(context.Background(), "   "); err != nil { // whitespace == no msg
+		t.Fatalf("Push() error = %v", err)
+	}
+	if strings.Join(pushArgs, " ") != "stash push" {
+		t.Errorf("push args = %v, want a bare 'stash push' (no -m)", pushArgs)
+	}
+}
+
+func TestPushNothingToStash(t *testing.T) {
+	stubRunnerFunc(t, func(args ...string) ([]byte, []byte, error) {
+		// git prints this to stdout and exits zero, creating no stash.
+		return []byte("No local changes to save\n"), nil, nil
+	})
+	_, err := Push(context.Background(), "label")
+	if !errors.Is(err, ErrNothingToStash) {
+		t.Fatalf("Push() err = %v, want ErrNothingToStash", err)
+	}
+}
+
+func TestPushNotARepo(t *testing.T) {
+	stubRunner(t, "", "fatal: not a git repository (or any of the parent directories): .git", errors.New("exit status 128"))
+	_, err := Push(context.Background(), "label")
+	if !errors.Is(err, ErrNotARepo) {
+		t.Fatalf("Push() err = %v, want ErrNotARepo", err)
 	}
 }
