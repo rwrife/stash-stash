@@ -3,7 +3,9 @@
 // M3: when stdout is a TTY it reads real stashes and opens an interactive
 // Bubble Tea browser (scrollable list + diff preview); otherwise it prints the
 // plain, non-interactive table from M2 so pipes and CI stay script-friendly.
-// Sidecar labels and mutating actions arrive in later milestones (see PLAN.md).
+// M4 enriches each stash with sidecar labels (matched by content SHA) and a
+// diffstat, and lets the TUI (re)label a stash with `l`. Mutating actions
+// arrive in later milestones (see PLAN.md).
 package main
 
 import (
@@ -18,6 +20,8 @@ import (
 	"golang.org/x/term"
 
 	"github.com/rwrife/stash-stash/internal/git"
+	"github.com/rwrife/stash-stash/internal/meta"
+	"github.com/rwrife/stash-stash/internal/model"
 	"github.com/rwrife/stash-stash/internal/render"
 	"github.com/rwrife/stash-stash/internal/tui"
 )
@@ -75,7 +79,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return listOrBrowse(stdout, stderr)
 }
 
-// listOrBrowse loads the current repo's stashes and either opens the
+// listOrBrowse loads the current repo's stashes, enriches them with sidecar
+// labels (matched by content SHA) and diffstats, and either opens the
 // interactive TUI (TTY stdout, not --no-tui) or prints the plain table. It
 // returns the process exit code: 0 on success (including the no-stash case),
 // 1 on a real error talking to git, 1 on a TUI runtime failure.
@@ -93,14 +98,24 @@ func listOrBrowse(stdout, stderr io.Writer) int {
 	}
 
 	if len(stashes) == 0 {
+		// Still clean up sidecar entries for stashes that were dropped/popped
+		// outside stash-stash (loadAndApplyMeta prunes against the live set,
+		// which is empty here) so the metadata file doesn't accumulate cruft.
+		loadAndApplyMeta(ctx, stashes, stderr)
 		fmt.Fprintln(stdout, "No stashes found. Your graveyard is empty — nice. 🪦")
 		return 0
 	}
 
+	// Enrich with sidecar labels + diffstats. Metadata is best-effort: a
+	// sidecar problem must never stop us listing stashes, so a load error is
+	// reported to stderr but we continue label-less.
+	store := loadAndApplyMeta(ctx, stashes, stderr)
+	git.EnrichDiffstats(ctx, stashes)
+
 	// Interactive path: only when we have a real terminal and the user didn't
 	// opt out. Everything else (pipes, CI, --no-tui) gets the plain table.
 	if !noTUIFlag && stdout == os.Stdout && stdoutIsTTY() {
-		if err := tui.Run(stashes, git.Show, now(), os.Stdin, os.Stdout); err != nil {
+		if err := tui.Run(stashes, git.Show, store, now(), os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintf(stderr, "stash-stash: tui: %v\n", err)
 			return 1
 		}
@@ -112,4 +127,36 @@ func listOrBrowse(stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// loadAndApplyMeta loads the sidecar store, applies any stored labels onto the
+// stashes by content SHA, and prunes metadata for stashes that no longer
+// exist. It returns the store (possibly with pruned entries) so the TUI can
+// persist relabels; on any load error it reports to stderr and returns nil,
+// leaving the stashes label-less but fully usable.
+func loadAndApplyMeta(ctx context.Context, stashes []model.Stash, stderr io.Writer) *meta.Store {
+	store, err := meta.Load(ctx)
+	if err != nil {
+		// ErrNotARepo "can't happen" here (git.List already succeeded), but if
+		// the sidecar is unreadable, degrade gracefully rather than fail.
+		fmt.Fprintf(stderr, "stash-stash: sidecar metadata unavailable (%v); continuing without labels.\n", err)
+		return nil
+	}
+
+	live := make(map[string]struct{}, len(stashes))
+	for i := range stashes {
+		live[stashes[i].SHA] = struct{}{}
+		if label, ok := store.Label(stashes[i].SHA); ok {
+			stashes[i].Label = label
+		}
+	}
+
+	// Garbage-collect labels for stashes dropped/popped outside stash-stash.
+	// Persist only if something actually changed, to avoid needless writes.
+	if n := store.Prune(live); n > 0 {
+		if err := store.Save(); err != nil {
+			fmt.Fprintf(stderr, "stash-stash: could not prune stale sidecar entries (%v).\n", err)
+		}
+	}
+	return store
 }

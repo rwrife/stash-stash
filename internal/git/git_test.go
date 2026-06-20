@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/rwrife/stash-stash/internal/model"
 )
 
 // stubRunner swaps the package runner for the duration of a test.
@@ -137,5 +139,81 @@ func TestShowGitError(t *testing.T) {
 	}
 	if errors.Is(err, ErrNotARepo) {
 		t.Errorf("err = %v, want a generic git error, not ErrNotARepo", err)
+	}
+}
+
+func TestDiffstatParsesNumstat(t *testing.T) {
+	// Two text files plus a binary one ("-\t-").
+	out := "12\t3\tcmd/main.go\n" +
+		"4\t0\tREADME.md\n" +
+		"-\t-\tlogo.png\n"
+	stubRunner(t, out, "", nil)
+
+	ds, err := Diffstat(context.Background(), "stash@{0}")
+	if err != nil {
+		t.Fatalf("Diffstat() error = %v", err)
+	}
+	if ds.Added != 16 || ds.Deleted != 3 {
+		t.Errorf("added/deleted = %d/%d, want 16/3", ds.Added, ds.Deleted)
+	}
+	if ds.Files != 3 {
+		t.Errorf("files = %d, want 3", ds.Files)
+	}
+	if !ds.Binary {
+		t.Error("Binary = false, want true (logo.png is binary)")
+	}
+}
+
+func TestDiffstatEmpty(t *testing.T) {
+	stubRunner(t, "", "", nil)
+	ds, err := Diffstat(context.Background(), "stash@{0}")
+	if err != nil {
+		t.Fatalf("Diffstat() error = %v", err)
+	}
+	if !ds.IsZero() {
+		t.Errorf("empty numstat = %+v, want zero diffstat", ds)
+	}
+}
+
+func TestParseNumstatSkipsMalformed(t *testing.T) {
+	out := "\n" + // blank
+		"only-two\tfields\n" + // too few tabs
+		"7\t2\tgood.go\n" // valid
+	ds := parseNumstat([]byte(out))
+	if ds.Files != 1 || ds.Added != 7 || ds.Deleted != 2 {
+		t.Errorf("parseNumstat skipped wrong lines: %+v", ds)
+	}
+}
+
+func TestDiffstatNotARepo(t *testing.T) {
+	stubRunner(t, "", "fatal: not a git repository (or any of the parent directories): .git", errors.New("exit status 128"))
+	_, err := Diffstat(context.Background(), "stash@{0}")
+	if !errors.Is(err, ErrNotARepo) {
+		t.Fatalf("err = %v, want ErrNotARepo", err)
+	}
+}
+
+func TestEnrichDiffstatsAttachesStats(t *testing.T) {
+	// One file, +5 -1, returned for every stash via the stub.
+	stubRunner(t, "5\t1\tfile.go\n", "", nil)
+	stashes := []model.Stash{
+		{Index: 0, SHA: "a"},
+		{Index: 1, SHA: "b"},
+	}
+	EnrichDiffstats(context.Background(), stashes)
+	for i, s := range stashes {
+		if s.Diffstat.Added != 5 || s.Diffstat.Deleted != 1 || s.Diffstat.Files != 1 {
+			t.Errorf("stash[%d].Diffstat = %+v, want +5 -1 / 1 file", i, s.Diffstat)
+		}
+	}
+}
+
+func TestEnrichDiffstatsToleratesError(t *testing.T) {
+	// A failing git call must leave a zero diffstat, not blow up the slice.
+	stubRunner(t, "", "fatal: bad revision", errors.New("exit status 128"))
+	stashes := []model.Stash{{Index: 0, SHA: "a"}}
+	EnrichDiffstats(context.Background(), stashes)
+	if !stashes[0].Diffstat.IsZero() {
+		t.Errorf("errored diffstat = %+v, want zero", stashes[0].Diffstat)
 	}
 }

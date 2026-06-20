@@ -30,17 +30,31 @@ func stubShow(ctx context.Context, ref string) (string, error) {
 	return "diff for " + ref, nil
 }
 
+// fakeStore is an in-memory labeler for testing the relabel flow without
+// touching disk. saveErr, when set, makes Save fail so the error path can be
+// exercised.
+type fakeStore struct {
+	labels  map[string]string
+	saves   int
+	saveErr error
+}
+
+func newFakeStore() *fakeStore { return &fakeStore{labels: map[string]string{}} }
+
+func (f *fakeStore) SetLabel(sha, label string) { f.labels[sha] = label }
+func (f *fakeStore) Save() error                { f.saves++; return f.saveErr }
+
 // sized returns a model that has received an initial WindowSizeMsg so the
 // viewport and layout fields are populated (View would otherwise short-circuit).
 func sized(t *testing.T) Model {
 	t.Helper()
-	m := New(sampleStashes(), stubShow, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), fixedNow)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	return updated.(Model)
 }
 
 func TestInitLoadsTopStash(t *testing.T) {
-	m := New(sampleStashes(), stubShow, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), fixedNow)
 	cmd := m.Init()
 	if cmd == nil {
 		t.Fatal("Init() returned nil cmd, want a diff-load command")
@@ -59,7 +73,7 @@ func TestInitLoadsTopStash(t *testing.T) {
 }
 
 func TestInitEmptyStashesNoCmd(t *testing.T) {
-	m := New(nil, stubShow, fixedNow)
+	m := New(nil, stubShow, newFakeStore(), fixedNow)
 	if cmd := m.Init(); cmd != nil {
 		t.Errorf("Init() with no stashes = non-nil cmd, want nil")
 	}
@@ -157,7 +171,7 @@ func TestViewRendersListAndPreview(t *testing.T) {
 }
 
 func TestViewBeforeSizeIsLoadingMessage(t *testing.T) {
-	m := New(sampleStashes(), stubShow, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), fixedNow)
 	if got := m.View(); !strings.Contains(got, "Loading") {
 		t.Errorf("pre-size View() = %q, want a loading message", got)
 	}
@@ -215,6 +229,170 @@ func TestRenderDiffEmpty(t *testing.T) {
 		t.Errorf("renderDiff() for blank patch = %q, want an empty-diff note", got)
 	}
 }
+
+// typeRunes feeds a string into the model one rune at a time, returning the
+// updated model (used to drive the inline label editor in tests).
+func typeRunes(t *testing.T, m Model, s string) Model {
+	t.Helper()
+	for _, r := range s {
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+		m = updated.(Model)
+	}
+	return m
+}
+
+func TestLabelEditSavesAndUpdatesList(t *testing.T) {
+	store := newFakeStore()
+	m := New(sampleStashes(), stubShow, store, fixedNow)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	// Open the editor on stash@{0} (SHA "aaa") with 'l'.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if !m.editing {
+		t.Fatal("'l' did not open the label editor")
+	}
+
+	// Type a label and commit with Enter.
+	m = typeRunes(t, m, "db migration wip")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.editing {
+		t.Error("editor still open after Enter")
+	}
+	// Persisted to the store, keyed by content SHA.
+	if store.labels["aaa"] != "db migration wip" {
+		t.Errorf("store label for aaa = %q, want %q", store.labels["aaa"], "db migration wip")
+	}
+	if store.saves != 1 {
+		t.Errorf("Save called %d times, want 1", store.saves)
+	}
+	// In-memory stash updated so the list reflects it immediately.
+	if m.stashes[0].Label != "db migration wip" {
+		t.Errorf("in-memory label = %q, want the new label", m.stashes[0].Label)
+	}
+	if !strings.Contains(stripANSI(m.View()), "db migration wip") {
+		t.Errorf("View() does not show the new label:\n%s", stripANSI(m.View()))
+	}
+}
+
+func TestLabelEditCancelDiscards(t *testing.T) {
+	store := newFakeStore()
+	m := New(sampleStashes(), stubShow, store, fixedNow)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	m = typeRunes(t, m, "throwaway")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.editing {
+		t.Error("Esc did not close the editor")
+	}
+	if _, ok := store.labels["aaa"]; ok {
+		t.Error("cancelled edit still wrote to the store")
+	}
+	if store.saves != 0 {
+		t.Errorf("Save called %d times on cancel, want 0", store.saves)
+	}
+	if m.stashes[0].Label != "" {
+		t.Errorf("cancelled edit changed in-memory label to %q", m.stashes[0].Label)
+	}
+}
+
+func TestLabelEditEmptyClears(t *testing.T) {
+	store := newFakeStore()
+	stashes := sampleStashes()
+	stashes[0].Label = "old label" // pretend it was labeled
+	m := New(stashes, stubShow, store, fixedNow)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	// Open editor (seeded with "old label"), clear it, commit.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	for m.input.Value() != "" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.stashes[0].Label != "" {
+		t.Errorf("label not cleared, got %q", m.stashes[0].Label)
+	}
+	if store.labels["aaa"] != "" {
+		t.Errorf("store label not cleared, got %q", store.labels["aaa"])
+	}
+}
+
+func TestLabelDisabledWithoutStore(t *testing.T) {
+	m := New(sampleStashes(), stubShow, nil, fixedNow)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	if m.editing {
+		t.Error("label editor opened despite a nil store")
+	}
+}
+
+func TestLabelEditSaveErrorSurfaced(t *testing.T) {
+	store := newFakeStore()
+	store.saveErr = errTest
+	m := New(sampleStashes(), stubShow, store, fixedNow)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	m = typeRunes(t, m, "x")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if !strings.Contains(m.notice, "save failed") {
+		t.Errorf("notice = %q, want a save-failed message", m.notice)
+	}
+}
+
+func TestListRendersLabelOverSubject(t *testing.T) {
+	stashes := sampleStashes()
+	stashes[1].Label = "feature work label"
+	m := New(stashes, stubShow, newFakeStore(), fixedNow)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	out := stripANSI(m.View())
+	if !strings.Contains(out, "feature work label") {
+		t.Errorf("View() missing the sidecar label:\n%s", out)
+	}
+}
+
+func TestEditingSwallowsNavigationKeys(t *testing.T) {
+	// While editing, 'j' is text, not a cursor move.
+	m := sized(t)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	m = updated.(Model)
+	m = typeRunes(t, m, "j")
+	if m.cursor != 0 {
+		t.Errorf("cursor moved to %d while editing; 'j' should be text", m.cursor)
+	}
+	if m.input.Value() != "j" {
+		t.Errorf("input = %q, want %q", m.input.Value(), "j")
+	}
+}
+
+// errTest is a sentinel error for save-failure paths.
+var errTest = testErr("boom")
+
+type testErr string
+
+func (e testErr) Error() string { return string(e) }
 
 // stripANSI removes ANSI escape sequences so assertions can match plain text.
 func stripANSI(s string) string {

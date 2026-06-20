@@ -16,11 +16,12 @@ import (
 // Run launches the interactive stash browser and blocks until the user quits.
 //
 // It is the TUI counterpart to the plain-table path in main: callers should
-// only reach here when stdout is a TTY and there is at least one stash. The
-// out/in writers/readers let tests and non-default terminals be wired
-// explicitly; pass os.Stdout / os.Stdin for normal use.
-func Run(stashes []model.Stash, show ShowFunc, now time.Time, in io.Reader, out io.Writer) error {
-	m := New(stashes, show, now)
+// only reach here when stdout is a TTY and there is at least one stash. store
+// persists relabels (may be nil to disable labeling). The out/in writers/
+// readers let tests and non-default terminals be wired explicitly; pass
+// os.Stdout / os.Stdin for normal use.
+func Run(stashes []model.Stash, show ShowFunc, store labeler, now time.Time, in io.Reader, out io.Writer) error {
+	m := New(stashes, show, store, now)
 	p := tea.NewProgram(m, tea.WithInput(in), tea.WithOutput(out), tea.WithAltScreen())
 	_, err := p.Run()
 	return err

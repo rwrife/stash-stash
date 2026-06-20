@@ -12,8 +12,10 @@ import (
 func TestTable(t *testing.T) {
 	now := time.Date(2026, 6, 17, 12, 0, 0, 0, time.UTC)
 	stashes := []model.Stash{
-		{Index: 0, SHA: "deadbeef", Subject: "WIP on main: fix retry", Branch: "main", Created: now.Add(-2 * time.Hour)},
-		{Index: 1, SHA: "cafebabe", Subject: "On feature/x: half-done", Branch: "", Created: now.Add(-5 * 24 * time.Hour)},
+		{Index: 0, SHA: "deadbeef", Subject: "WIP on main: fix retry", Branch: "main", Created: now.Add(-2 * time.Hour),
+			Diffstat: model.Diffstat{Added: 12, Deleted: 3, Files: 2}},
+		{Index: 1, SHA: "cafebabe", Subject: "On feature/x: half-done", Branch: "", Created: now.Add(-5 * 24 * time.Hour),
+			Label: "payments: retry fix"},
 	}
 
 	var buf bytes.Buffer
@@ -22,10 +24,19 @@ func TestTable(t *testing.T) {
 	}
 	out := buf.String()
 
-	for _, want := range []string{"INDEX", "SUBJECT", "AGE", "BRANCH", "stash@{0}", "stash@{1}", "2h", "5d", "main"} {
+	for _, want := range []string{"INDEX", "LABEL", "AGE", "BRANCH", "CHANGES",
+		"stash@{0}", "stash@{1}", "2h", "5d", "main",
+		"+12 -3",              // diffstat for row 0
+		"payments: retry fix", // sidecar label for row 1 (overrides subject)
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("table missing %q\n---\n%s", want, out)
 		}
+	}
+
+	// The sidecar label must replace the raw subject when present.
+	if strings.Contains(out, "On feature/x: half-done") {
+		t.Errorf("labeled stash still shows raw subject:\n%s", out)
 	}
 
 	// Empty branch should render as a dash.
