@@ -63,13 +63,13 @@ func (f *fakeStore) Prune(liveSHAs map[string]struct{}) int {
 // viewport and layout fields are populated (View would otherwise short-circuit).
 func sized(t *testing.T) Model {
 	t.Helper()
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	return updated.(Model)
 }
 
 func TestInitLoadsTopStash(t *testing.T) {
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
 	cmd := m.Init()
 	if cmd == nil {
 		t.Fatal("Init() returned nil cmd, want a diff-load command")
@@ -88,7 +88,7 @@ func TestInitLoadsTopStash(t *testing.T) {
 }
 
 func TestInitEmptyStashesNoCmd(t *testing.T) {
-	m := New(nil, stubShow, newFakeStore(), Actions{}, fixedNow)
+	m := New(nil, stubShow, newFakeStore(), Actions{}, fixedNow, 0)
 	if cmd := m.Init(); cmd != nil {
 		t.Errorf("Init() with no stashes = non-nil cmd, want nil")
 	}
@@ -186,7 +186,7 @@ func TestViewRendersListAndPreview(t *testing.T) {
 }
 
 func TestViewBeforeSizeIsLoadingMessage(t *testing.T) {
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
 	if got := m.View(); !strings.Contains(got, "Loading") {
 		t.Errorf("pre-size View() = %q, want a loading message", got)
 	}
@@ -258,7 +258,7 @@ func typeRunes(t *testing.T, m Model, s string) Model {
 
 func TestLabelEditSavesAndUpdatesList(t *testing.T) {
 	store := newFakeStore()
-	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow)
+	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -295,7 +295,7 @@ func TestLabelEditSavesAndUpdatesList(t *testing.T) {
 
 func TestLabelEditCancelDiscards(t *testing.T) {
 	store := newFakeStore()
-	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow)
+	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -323,7 +323,7 @@ func TestLabelEditEmptyClears(t *testing.T) {
 	store := newFakeStore()
 	stashes := sampleStashes()
 	stashes[0].Label = "old label" // pretend it was labeled
-	m := New(stashes, stubShow, store, Actions{}, fixedNow)
+	m := New(stashes, stubShow, store, Actions{}, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -346,7 +346,7 @@ func TestLabelEditEmptyClears(t *testing.T) {
 }
 
 func TestLabelDisabledWithoutStore(t *testing.T) {
-	m := New(sampleStashes(), stubShow, nil, Actions{}, fixedNow)
+	m := New(sampleStashes(), stubShow, nil, Actions{}, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -360,7 +360,7 @@ func TestLabelDisabledWithoutStore(t *testing.T) {
 func TestLabelEditSaveErrorSurfaced(t *testing.T) {
 	store := newFakeStore()
 	store.saveErr = errTest
-	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow)
+	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -378,7 +378,7 @@ func TestLabelEditSaveErrorSurfaced(t *testing.T) {
 func TestListRendersLabelOverSubject(t *testing.T) {
 	stashes := sampleStashes()
 	stashes[1].Label = "feature work label"
-	m := New(stashes, stubShow, newFakeStore(), Actions{}, fixedNow)
+	m := New(stashes, stubShow, newFakeStore(), Actions{}, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -460,7 +460,7 @@ func runCmd(t *testing.T, m Model, cmd tea.Cmd) Model {
 func TestApplyRunsImmediatelyWithToast(t *testing.T) {
 	var applied []string
 	actions := Actions{Apply: recordingAction(&applied, nil)}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -482,7 +482,7 @@ func TestApplyRunsImmediatelyWithToast(t *testing.T) {
 func TestDropAsksForConfirmation(t *testing.T) {
 	var dropped []string
 	actions := Actions{Drop: recordingAction(&dropped, nil), Reload: reloadReturning(nil, nil)}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -506,7 +506,7 @@ func TestDropAsksForConfirmation(t *testing.T) {
 func TestConfirmNoCancelsDrop(t *testing.T) {
 	var dropped []string
 	actions := Actions{Drop: recordingAction(&dropped, nil), Reload: reloadReturning(nil, nil)}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -543,7 +543,7 @@ func TestConfirmYesDropsPrunesAndReloads(t *testing.T) {
 	store.labels["bbb"] = "keeper"
 	actions := Actions{Drop: recordingAction(&dropped, nil), Reload: reloadReturning(remaining, nil)}
 
-	m := New(sampleStashes(), stubShow, store, actions, fixedNow)
+	m := New(sampleStashes(), stubShow, store, actions, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -581,7 +581,7 @@ func TestPopErrorSurfacesToast(t *testing.T) {
 		Pop:    recordingAction(new([]string), testErr("CONFLICT in foo.txt")),
 		Reload: reloadReturning(nil, nil),
 	}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -603,7 +603,7 @@ func TestPopErrorSurfacesToast(t *testing.T) {
 
 func TestActionUnavailableWithoutFunc(t *testing.T) {
 	// Zero Actions: pressing 'd' should neither confirm nor crash.
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
@@ -623,7 +623,7 @@ func TestDropLastStashShowsEmptyState(t *testing.T) {
 	// A single stash; dropping it empties the list.
 	one := []model.Stash{{Index: 0, SHA: "solo", Subject: "WIP on main: only", Branch: "main", Created: fixedNow.Add(-time.Hour)}}
 	actions := Actions{Drop: recordingAction(new([]string), nil), Reload: reloadReturning(nil, nil)}
-	m := New(one, stubShow, newFakeStore(), actions, fixedNow)
+	m := New(one, stubShow, newFakeStore(), actions, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -643,7 +643,7 @@ func TestDropLastStashShowsEmptyState(t *testing.T) {
 
 func TestBusyLocksInput(t *testing.T) {
 	// While busy, navigation keys are ignored (only ctrl+c quits).
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 	m.busy = true
@@ -654,5 +654,37 @@ func TestBusyLocksInput(t *testing.T) {
 	}
 	if cmd != nil {
 		t.Error("navigation while busy produced a cmd, want nil")
+	}
+}
+
+func TestDustBannerAndMarker(t *testing.T) {
+	// sampleStashes are 2h / 48h / 72h old. With a 2-day threshold the latter
+	// two are dusty, so the title row nags and stale ages get a trailing "*".
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 2)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+	out := stripANSI(m.View())
+
+	if !strings.Contains(out, "2 are gathering dust") {
+		t.Errorf("expected dust banner counting 2 stashes:\n%s", out)
+	}
+	// The 48h/72h rows render as "2d"/"3d" and must be starred; the fresh 2h
+	// row must not be.
+	if !strings.Contains(out, "2d*") || !strings.Contains(out, "3d*") {
+		t.Errorf("stale rows should show starred ages:\n%s", out)
+	}
+	if strings.Contains(out, "2h*") {
+		t.Errorf("fresh row should not be starred:\n%s", out)
+	}
+}
+
+func TestDustBannerDisabled(t *testing.T) {
+	// staleDays=0 disables the nag entirely even for old stashes.
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+	out := stripANSI(m.View())
+	if strings.Contains(out, "gathering dust") {
+		t.Errorf("staleDays=0 must not nag:\n%s", out)
 	}
 }

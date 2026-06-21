@@ -19,10 +19,11 @@ import (
 // only reach here when stdout is a TTY and there is at least one stash. store
 // persists relabels (may be nil to disable labeling); actions supplies the
 // mutating apply/pop/drop operations plus a reload (a zero Actions disables
-// them). The out/in writers/readers let tests and non-default terminals be
-// wired explicitly; pass os.Stdout / os.Stdin for normal use.
-func Run(stashes []model.Stash, show ShowFunc, store labeler, actions Actions, now time.Time, in io.Reader, out io.Writer) error {
-	m := New(stashes, show, store, actions, now)
+// them). staleDays drives the "gathering dust" banner and per-row staleness
+// coloring (0 disables). The out/in writers/readers let tests and non-default
+// terminals be wired explicitly; pass os.Stdout / os.Stdin for normal use.
+func Run(stashes []model.Stash, show ShowFunc, store labeler, actions Actions, now time.Time, staleDays int, in io.Reader, out io.Writer) error {
+	m := New(stashes, show, store, actions, now, staleDays)
 	p := tea.NewProgram(m, tea.WithInput(in), tea.WithOutput(out), tea.WithAltScreen())
 	_, err := p.Run()
 	return err

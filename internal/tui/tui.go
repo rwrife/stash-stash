@@ -126,6 +126,19 @@ var (
 	// confirmStyle frames the destructive-action y/N prompt so it reads as a
 	// warning, not a casual hint.
 	confirmStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203")).Padding(0, 1)
+
+	// --- M6 staleness ---
+	// bannerStyle frames the "gathering dust" nag in the title row: amber on
+	// nothing, bold, so it reads as a gentle alert.
+	bannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Padding(0, 1)
+
+	// Age token colors by staleness bucket, applied to the age in each row.
+	// Fresh stays dim (no special attention), aging goes amber, stale orange,
+	// ancient red — a clear "the older, the hotter" ramp.
+	ageFreshStyle   = dimStyle
+	ageAgingStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))            // soft amber
+	ageStaleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))            // orange
+	ageAncientStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203")) // red
 )
 
 // diffLoadedMsg carries the result of an asynchronous git.Show for a stash.
@@ -242,20 +255,25 @@ type Model struct {
 	confirming bool       // true while a y/n destructive-action prompt is open
 	pending    actionKind // which destructive action awaits confirmation
 	busy       bool       // true while a mutating op is in flight (input locked)
+
+	// --- M6 staleness ---
+	staleDays int // age threshold (days) for "gathering dust"; 0 disables
 }
 
 // New builds a Model over the given stashes, using show to fetch diffs, store
 // to persist relabels (may be nil to disable labeling), actions to perform the
-// mutating apply/pop/drop operations (a zero Actions disables them), and now to
-// compute ages. The caller is responsible for the empty-stash and not-a-repo
-// cases before reaching the TUI.
-func New(stashes []model.Stash, show ShowFunc, store labeler, actions Actions, now time.Time) Model {
+// mutating apply/pop/drop operations (a zero Actions disables them), now to
+// compute ages, and staleDays as the staleness threshold (0 disables the nag
+// and stale coloring). The caller is responsible for the empty-stash and
+// not-a-repo cases before reaching the TUI.
+func New(stashes []model.Stash, show ShowFunc, store labeler, actions Actions, now time.Time, staleDays int) Model {
 	return Model{
 		stashes:   stashes,
 		show:      show,
 		store:     store,
 		actions:   actions,
 		now:       now,
+		staleDays: staleDays,
 		loadedFor: -1,
 	}
 }
@@ -689,6 +707,11 @@ func (m Model) View() string {
 	title := titleStyle.Render(fmt.Sprintf("🪦 stash-stash — %d %s",
 		len(m.stashes), plural(len(m.stashes), "stash", "stashes")))
 
+	// Append the "gathering dust" nag to the title row when any stash is dusty.
+	if banner := m.dustBanner(); banner != "" {
+		title = lipgloss.JoinHorizontal(lipgloss.Top, title, bannerStyle.Render(banner))
+	}
+
 	list := listPaneStyle.
 		Width(m.listInnerW).
 		Height(m.innerH).
@@ -758,8 +781,12 @@ func (m Model) formatRow(s model.Stash) string {
 	ageTok := age.Humanize(s.Created, m.now)
 
 	// First line: ref + age, plus the diffstat when there is one. Keeps the
-	// most-skimmable facts together.
-	head := fmt.Sprintf("%s  %s", s.Ref(), dimStyle.Render(ageTok))
+	// most-skimmable facts together. The age is colored by staleness bucket and
+	// a dusty stash gets a trailing "*" so it reads even without color.
+	if age.Classify(s.Created, m.now, m.staleDays).Dusty() {
+		ageTok += "*"
+	}
+	head := fmt.Sprintf("%s  %s", s.Ref(), m.ageStyleFor(s).Render(ageTok))
 	if stat := s.Diffstat.String(); stat != "" {
 		head += "  " + statStyle.Render(stat)
 	}
@@ -775,6 +802,14 @@ func (m Model) formatRow(s model.Stash) string {
 	br := branchStyle.Render(truncate("⎇ "+branch, m.listInnerW))
 
 	return head + "\n" + subj + "\n" + br
+}
+
+// plural picks the singular or plural noun for n.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // renderDiff produces the preview pane content for the currently-loaded stash:
@@ -796,12 +831,42 @@ func (m Model) renderDiff() string {
 	return colorizeDiff(loaded)
 }
 
-// plural picks the singular or plural noun for n.
-func plural(n int, one, many string) string {
-	if n == 1 {
-		return one
+// dustBanner returns the short "gathering dust" nag for the title row, or ""
+// when nothing is dusty (or staleness is disabled). It counts stashes whose
+// staleness bucket is Dusty under the active threshold.
+func (m Model) dustBanner() string {
+	if m.staleDays <= 0 {
+		return ""
 	}
-	return many
+	dusty := 0
+	for _, s := range m.stashes {
+		if age.Classify(s.Created, m.now, m.staleDays).Dusty() {
+			dusty++
+		}
+	}
+	if dusty == 0 {
+		return ""
+	}
+	verb := "is"
+	if dusty != 1 {
+		verb = "are"
+	}
+	return fmt.Sprintf("🧹 %d %s gathering dust", dusty, verb)
+}
+
+// ageStyleFor returns the lipgloss style for a stash's age token based on its
+// staleness bucket, so the list shades older stashes hotter.
+func (m Model) ageStyleFor(s model.Stash) lipgloss.Style {
+	switch age.Classify(s.Created, m.now, m.staleDays) {
+	case age.Ancient:
+		return ageAncientStyle
+	case age.Stale:
+		return ageStaleStyle
+	case age.Aging:
+		return ageAgingStyle
+	default:
+		return ageFreshStyle
+	}
 }
 
 // condense flattens a multi-line error message (git loves these) into a single
