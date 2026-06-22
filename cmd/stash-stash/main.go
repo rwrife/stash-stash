@@ -23,6 +23,7 @@ import (
 	"golang.org/x/term"
 
 	"github.com/rwrife/stash-stash/internal/git"
+	"github.com/rwrife/stash-stash/internal/jsonout"
 	"github.com/rwrife/stash-stash/internal/meta"
 	"github.com/rwrife/stash-stash/internal/model"
 	"github.com/rwrife/stash-stash/internal/render"
@@ -47,6 +48,10 @@ var stdoutIsTTY = func() bool {
 // noTUI lets `--no-tui` (or a non-TTY stdout) force the plain table even in an
 // interactive shell, which is handy for screenshots, logs, and scripting.
 var noTUIFlag bool
+
+// defaultStaleDays is the age (in days) at or beyond which a stash is
+// considered to be "gathering dust". Overridable via --stale-days.
+const defaultStaleDays = 14
 
 // gitPush and metaLoad are indirected so the push subcommand can be unit-tested
 // without a real repo or working-tree changes. They default to the real
@@ -77,9 +82,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
-
 	showVersion := fs.Bool("version", false, "print version and exit")
 	fs.BoolVar(&noTUIFlag, "no-tui", false, "force plain table output even on a TTY")
+	staleDays := fs.Int("stale-days", defaultStaleDays, "flag stashes older than this many days as gathering dust (0 disables)")
+	jsonOut := fs.Bool("json", false, "print the stash list as JSON for scripting (implies --no-tui)")
 
 	if err := fs.Parse(args); err != nil {
 		// flag already printed the error + usage; -h/--help returns ErrHelp.
@@ -94,15 +100,22 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	return listOrBrowse(stdout, stderr)
+	if *staleDays < 0 {
+		fmt.Fprintln(stderr, "stash-stash: --stale-days must be >= 0 (0 disables the staleness nag).")
+		return 2
+	}
+
+	return listOrBrowse(stdout, stderr, *staleDays, *jsonOut)
 }
 
 // listOrBrowse loads the current repo's stashes, enriches them with sidecar
-// labels (matched by content SHA) and diffstats, and either opens the
-// interactive TUI (TTY stdout, not --no-tui) or prints the plain table. It
-// returns the process exit code: 0 on success (including the no-stash case),
-// 1 on a real error talking to git, 1 on a TUI runtime failure.
-func listOrBrowse(stdout, stderr io.Writer) int {
+// labels (matched by content SHA) and diffstats, and either emits JSON
+// (--json), opens the interactive TUI (TTY stdout, not --no-tui/--json), or
+// prints the plain table. staleDays drives the "gathering dust" nag and the
+// stale highlighting/markers (0 disables). It returns the process exit code: 0
+// on success (including the no-stash case), 1 on a real error talking to git,
+// 1 on a TUI runtime failure.
+func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool) int {
 	ctx := context.Background()
 
 	stashes, err := git.List(ctx)
@@ -120,6 +133,13 @@ func listOrBrowse(stdout, stderr io.Writer) int {
 		// outside stash-stash (loadAndApplyMeta prunes against the live set,
 		// which is empty here) so the metadata file doesn't accumulate cruft.
 		loadAndApplyMeta(ctx, stashes, stderr)
+		if jsonOut {
+			if err := jsonout.Write(stdout, stashes, now(), staleDays); err != nil {
+				fmt.Fprintf(stderr, "stash-stash: encoding json: %v\n", err)
+				return 1
+			}
+			return 0
+		}
 		fmt.Fprintln(stdout, "No stashes found. Your graveyard is empty — nice. 🪦")
 		return 0
 	}
@@ -129,6 +149,16 @@ func listOrBrowse(stdout, stderr io.Writer) int {
 	// reported to stderr but we continue label-less.
 	store := loadAndApplyMeta(ctx, stashes, stderr)
 	git.EnrichDiffstats(ctx, stashes)
+
+	// JSON output is for scripting: deterministic, never interactive, and
+	// independent of TTY detection.
+	if jsonOut {
+		if err := jsonout.Write(stdout, stashes, now(), staleDays); err != nil {
+			fmt.Fprintf(stderr, "stash-stash: encoding json: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 
 	// Interactive path: only when we have a real terminal and the user didn't
 	// opt out. Everything else (pipes, CI, --no-tui) gets the plain table.
@@ -156,14 +186,14 @@ func listOrBrowse(stdout, stderr io.Writer) int {
 				return fresh, nil
 			},
 		}
-		if err := tui.Run(stashes, git.Show, store, actions, now(), os.Stdin, os.Stdout); err != nil {
+		if err := tui.Run(stashes, git.Show, store, actions, now(), staleDays, os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintf(stderr, "stash-stash: tui: %v\n", err)
 			return 1
 		}
 		return 0
 	}
 
-	if err := render.Table(stdout, stashes, now()); err != nil {
+	if err := render.Table(stdout, stashes, now(), staleDays); err != nil {
 		fmt.Fprintf(stderr, "stash-stash: rendering table: %v\n", err)
 		return 1
 	}

@@ -46,6 +46,30 @@ func TestRunHelp(t *testing.T) {
 	}
 }
 
+func TestRunHelpListsM6Flags(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	run([]string{"-h"}, &stdout, &stderr)
+	help := stderr.String()
+	for _, want := range []string{"-stale-days", "-json"} {
+		if !strings.Contains(help, want) {
+			t.Errorf("help missing flag %q:\n%s", want, help)
+		}
+	}
+}
+
+func TestRunRejectsNegativeStaleDays(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	// Negative --stale-days is rejected before any git work, so this is
+	// deterministic regardless of the working directory.
+	code := run([]string{"--stale-days=-1"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 for negative --stale-days", code)
+	}
+	if !strings.Contains(stderr.String(), "stale-days") {
+		t.Errorf("stderr = %q, want it to mention stale-days", stderr.String())
+	}
+}
+
 // --- M5: push subcommand -------------------------------------------------
 
 // stubPush swaps the indirected gitPush for the duration of a test.
