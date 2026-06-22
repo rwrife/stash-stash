@@ -54,8 +54,9 @@ go build -o stash-stash ./cmd/stash-stash
 > **v0.1 (complete):** the binary reads your real stashes and — when stdout is
 > a terminal — opens an **interactive TUI**: a scrollable list on the left and a
 > live `git stash show -p` diff preview on the right. Each stash shows its
-> **sidecar label** (or the raw git subject) plus a **diffstat**, and `l`
-> (re)labels the selected stash; labels are keyed by content SHA so they survive
+> **sidecar label**, an **auto-derived label** when you haven't named it (from
+> the origin branch + the top changed file, e.g. `payments: retry`), or the raw
+> git subject — plus a **diffstat**. `l` (re)labels the selected stash; labels are keyed by content SHA so they survive
 > pop/push reordering. **You can act on stashes**: `a` applies, `p` pops, and
 > `d` drops the selected stash — pop and drop ask for a `y/N` confirm first, and
 > the sidecar is kept in sync on every mutation. `stash-stash push -m "label"`
@@ -81,8 +82,8 @@ stash-stash --json | jq .    # machine-readable list for scripting
 Run `stash-stash` inside a repo with stashes and you get a two-pane browser:
 
 - **Left:** every stash with its `stash@{N}` ref, age, **diffstat**
-  (`+N -M · K files`), its **label** (highlighted) or raw subject, and origin
-  branch.
+  (`+N -M · K files`), its **label** (highlighted), an **auto-label** (dim +
+  italic, when no label is set), or the raw subject, plus origin branch.
 - **Right:** the full unified diff (`git stash show -p`) for the selected stash,
   lightly colorized and scrollable.
 
@@ -113,19 +114,46 @@ stash is named from birth. Run without `-m` and it behaves like a plain
 so and does nothing.
 
 The plain (non-TTY / `--no-tui`) listing shows the same enrichment, with a
-`*` marking dusty stashes and a banner when any are stale:
+`*` marking dusty stashes (and a banner when any are stale) and a trailing `~`
+marking auto-derived labels:
 
 ```
 🧹 2 stashes are gathering dust (older than 14d) — triage them?
-AGE   INDEX      LABEL                   BRANCH     CHANGES
-2h    stash@{0}  On main: new file work  main       +8 -0 · 1 file
-5d    stash@{1}  payments: retry fix     main       +12 -3 · 2 files
-23d*  stash@{2}  On feature/x: modal     feature/x  +88 -1 · 4 files
+AGE   INDEX      LABEL                    BRANCH     CHANGES
+2h    stash@{0}  payments: new file ~     main       +8 -0 · 1 file
+5d    stash@{1}  payments: retry fix      main       +12 -3 · 2 files
+23d*  stash@{2}  feature/x: modal ~       feature/x  +88 -1 · 4 files
 
 (* = stale: older than 14d)
+(~ = auto-label from branch + top file; run `stash-stash push -m` or `l` to name it)
 ```
 
-(`LABEL` is your sidecar label when set, otherwise the raw git subject.)
+(`LABEL` is your sidecar label when set; otherwise an auto-derived
+`<area>: <hint>` from the branch + top changed file, marked `~`; otherwise the
+raw git subject.)
+
+## Auto-labels
+
+Not every stash gets a name in the heat of the moment. When a stash has **no
+sidecar label**, `stash-stash` derives one on the fly as `<area>: <hint>`:
+
+- **area** — from the origin branch, with conventional prefixes stripped
+  (`feature/payments` → `payments`, `fix/cache-miss` → `cache miss`).
+- **hint** — from the stash's *top changed file* (the one with the most churn):
+  the base name minus its extension (`internal/git/retry.go` → `retry`).
+
+So a stash born on `feature/payments` that mostly touches `internal/retry.go`
+shows as **`payments: retry`** instead of `WIP on feature/payments: a1b2c3d`.
+Auto-labels are:
+
+- **advisory** — never written to the sidecar; they're recomputed each run.
+- **clearly marked** — dim + italic in the TUI, trailing `~` in the plain table.
+- **easy to make real** — press `l` (or use `push -m`) to give the stash a name
+  that sticks; an explicit label always wins over the guess.
+
+If there's no changed-file signal (or nothing to go on), the raw git subject is
+shown instead — the branch alone never becomes a label, since it's already in
+its own column.
 
 ## Staleness nag
 
@@ -149,7 +177,16 @@ stash-stash --json | jq '.dusty_count'
 
 # List the refs + labels of everything older than the threshold
 stash-stash --json | jq -r '.stashes[] | select(.stale) | "\(.ref)\t\(.label // .subject)"'
+
+# Which stashes are relying on an auto-derived label (i.e. you never named them)?
+stash-stash --json | jq -r '.stashes[] | select(.label_source == "auto") | "\(.ref)\t\(.display)"'
 ```
+
+Each stash carries both the resolved `display` label and a `label_source` of
+`user` (your sidecar label), `auto` (a derived `<area>: <hint>`), or `subject`
+(fell back to git). `auto_label` is the derived guess (when one exists) even
+when a user label overrides it, and `top_file` is the changed file the hint came
+from.
 
 Shape:
 
@@ -164,8 +201,12 @@ Shape:
       "ref": "stash@{0}",
       "sha": "a1b2c3d",
       "label": "payments: retry fix",
+      "auto_label": "main: retry",
+      "display": "payments: retry fix",
+      "label_source": "user",
       "subject": "On main: retry fix",
       "branch": "main",
+      "top_file": "internal/retry.go",
       "created": "2026-06-21T10:00:00Z",
       "age": "2h",
       "age_seconds": 7200,

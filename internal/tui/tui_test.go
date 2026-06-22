@@ -388,6 +388,25 @@ func TestListRendersLabelOverSubject(t *testing.T) {
 	}
 }
 
+func TestListRendersAutoLabel(t *testing.T) {
+	// No sidecar label, but branch + top file → auto-label "payments: retry".
+	stashes := []model.Stash{
+		{Index: 0, SHA: "aaa", Subject: "WIP on feature/payments: deadbeef",
+			Branch: "feature/payments", TopFile: "internal/retry.go", Created: fixedNow.Add(-time.Hour)},
+	}
+	m := New(stashes, stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = updated.(Model)
+
+	out := stripANSI(m.View())
+	if !strings.Contains(out, "payments: retry") {
+		t.Errorf("View() missing auto-label \"payments: retry\":\n%s", out)
+	}
+	if strings.Contains(out, "deadbeef") {
+		t.Errorf("auto-labeled row still shows raw subject hash:\n%s", out)
+	}
+}
+
 func TestEditingSwallowsNavigationKeys(t *testing.T) {
 	// While editing, 'j' is text, not a cursor move.
 	m := sized(t)

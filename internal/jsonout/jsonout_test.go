@@ -61,6 +61,55 @@ func TestWriteSchema(t *testing.T) {
 	if dusty.Label != "payments: retry fix" {
 		t.Errorf("row1 label = %q", dusty.Label)
 	}
+	// row0 has a branch but no top file → no auto-label → source "subject".
+	if fresh.LabelSource != "subject" || fresh.Display != "WIP on main: fix retry" {
+		t.Errorf("row0 label source/display = %q/%q, want subject + raw subject", fresh.LabelSource, fresh.Display)
+	}
+	// row1 has an explicit user label → source "user", Display is the label.
+	if dusty.LabelSource != "user" || dusty.Display != "payments: retry fix" {
+		t.Errorf("row1 label source/display = %q/%q, want user + the label", dusty.LabelSource, dusty.Display)
+	}
+}
+
+func TestWriteAutoLabelFields(t *testing.T) {
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	stashes := []model.Stash{
+		// No user label; branch + top file → auto-label "payments: retry".
+		{Index: 0, SHA: "f00d", Subject: "WIP on feature/payments: f00d",
+			Branch: "feature/payments", TopFile: "internal/retry.go", Created: now.Add(-time.Hour)},
+		// User label set, but branch+file would also derive one: AutoLabel is
+		// still reported while Display/source reflect the user's choice.
+		{Index: 1, SHA: "beef", Subject: "x", Label: "typed",
+			Branch: "fix/cache", TopFile: "store.go", Created: now.Add(-time.Hour)},
+	}
+	var buf bytes.Buffer
+	if err := Write(&buf, stashes, now, 14); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	var got Output
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, buf.String())
+	}
+
+	auto := got.Stashes[0]
+	if auto.LabelSource != "auto" {
+		t.Errorf("row0 LabelSource = %q, want auto", auto.LabelSource)
+	}
+	if auto.AutoLabel != "payments: retry" || auto.Display != "payments: retry" {
+		t.Errorf("row0 auto_label/display = %q/%q, want payments: retry", auto.AutoLabel, auto.Display)
+	}
+	if auto.TopFile != "internal/retry.go" {
+		t.Errorf("row0 top_file = %q, want internal/retry.go", auto.TopFile)
+	}
+
+	user := got.Stashes[1]
+	if user.LabelSource != "user" || user.Display != "typed" {
+		t.Errorf("row1 source/display = %q/%q, want user + typed", user.LabelSource, user.Display)
+	}
+	// The derived guess is still surfaced even though a user label overrides it.
+	if user.AutoLabel != "cache: store" {
+		t.Errorf("row1 auto_label = %q, want cache: store", user.AutoLabel)
+	}
 }
 
 func TestWriteStaleDisabled(t *testing.T) {
