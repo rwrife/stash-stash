@@ -31,6 +31,9 @@ interactive TUI with diff preview, sidecar labels, apply/pop/drop, a labeled
 [`PLAN.md`](./PLAN.md) and the
 [milestones](https://github.com/rwrife/stash-stash/issues?q=label%3Amilestone).
 
+**Beyond v0.1:** auto-labels (`<area>: <hint>` from the branch + top changed
+file) and **`stash-stash search`** — grep across every stash's contents at once.
+
 ## Install
 
 ```bash
@@ -72,6 +75,8 @@ stash-stash --version        # print the version
 stash-stash --no-tui         # force the plain table even on a TTY
 stash-stash | cat            # piped/non-TTY → plain table automatically
 stash-stash push -m "label"  # stash with a label that actually sticks
+stash-stash search retry     # grep every stash's contents at once
+stash-stash search --regex 'retry.*=.*[0-9]'  # regex search (case-insensitive)
 stash-stash --stale-days 7   # flag anything older than a week as dusty
 stash-stash --stale-days 0   # disable the staleness nag entirely
 stash-stash --json | jq .    # machine-readable list for scripting
@@ -131,6 +136,43 @@ AGE   INDEX      LABEL                    BRANCH     CHANGES
 (`LABEL` is your sidecar label when set; otherwise an auto-derived
 `<area>: <hint>` from the branch + top changed file, marked `~`; otherwise the
 raw git subject.)
+
+### Searching stash contents
+
+```bash
+stash-stash search retry
+```
+
+"Which stash had that retry change?" Instead of applying stashes one by one to
+find out, `search` greps across **every stash's diff at once** — the exact
+change `git stash show -p` would apply — and prints each matching stash with its
+label, age, and origin branch, followed by the matching line snippets:
+
+```
+stash@{0}  feature: caps  (3m, master) — 1 match
+    c.txt:2: + ReTrY case test
+
+stash@{2}  payments: retry tweak  (5d, master) — 3 matches
+    a.txt:2: - retry budget = 3
+    a.txt:2: + retry budget = 5
+    a.txt:3: + added RETRY logic
+```
+
+Each snippet is `‹file›:‹line›: ‹±› ‹text›`, where `+`/`-`/space mark an added,
+removed, or context line and the line number is the stash's own (new-side for
+added/context, old-side for removed). Matching is a **case-insensitive
+substring by default**; pass `--regex` to treat the term as a regular
+expression (still case-insensitive unless your pattern sets its own flags):
+
+```bash
+stash-stash search --regex 'retry.*=.*[0-9]'
+```
+
+Unquoted multi-word terms are joined into a single phrase (`search retry budget`
+looks for `retry budget`). Diff metadata (headers, `index`, mode lines) is never
+matched — only real content. Exit status is `0` when the search runs (even with
+no matches, which prints a friendly note), `2` for a missing term or an
+un-compilable `--regex` pattern, and `1` if git can't be reached.
 
 ## Auto-labels
 

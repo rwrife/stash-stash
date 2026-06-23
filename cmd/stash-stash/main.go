@@ -27,6 +27,7 @@ import (
 	"github.com/rwrife/stash-stash/internal/meta"
 	"github.com/rwrife/stash-stash/internal/model"
 	"github.com/rwrife/stash-stash/internal/render"
+	"github.com/rwrife/stash-stash/internal/search"
 	"github.com/rwrife/stash-stash/internal/tui"
 )
 
@@ -55,10 +56,13 @@ const defaultStaleDays = 14
 
 // gitPush and metaLoad are indirected so the push subcommand can be unit-tested
 // without a real repo or working-tree changes. They default to the real
-// implementations.
+// implementations. gitList and gitShow are indirected likewise for the search
+// subcommand (which lists stashes and reads each one's patch).
 var (
 	gitPush  = git.Push
 	metaLoad = meta.Load
+	gitList  = git.List
+	gitShow  = git.Show
 )
 
 func main() {
@@ -69,17 +73,21 @@ func main() {
 // tests can exercise flag handling without calling os.Exit.
 func run(args []string, stdout, stderr io.Writer) int {
 	// Subcommand dispatch happens before flag parsing so subcommands own their
-	// own flags. Today only `push` exists; everything else is the default
-	// list/browse behavior (optionally with top-level flags).
+	// own flags. `push` records a labeled stash; `search` greps stash contents;
+	// everything else is the default list/browse behavior (optionally with
+	// top-level flags).
 	if len(args) > 0 && args[0] == "push" {
 		return runPush(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "search" {
+		return runSearch(args[1:], stdout, stderr)
 	}
 
 	fs := flag.NewFlagSet("stash-stash", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "stash-stash %s — a concierge for your git stash graveyard.\n\n", version)
-		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n\nFlags:\n")
+		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	showVersion := fs.Bool("version", false, "print version and exit")
@@ -300,5 +308,104 @@ func runPush(args []string, stdout, stderr io.Writer) int {
 	}
 
 	fmt.Fprintf(stdout, "Stashed and labeled %q. 🏷️\n", label)
+	return 0
+}
+
+// runSearch implements `stash-stash search <term> [--regex]`: it greps across
+// every stash's *contents* (the unified diff `git stash show -p` would apply)
+// so you can find "which stash had that retry change?" without applying each
+// one. Matching is a case-insensitive substring by default; --regex switches to
+// a (still case-insensitive) regular expression. Each stash with a hit is
+// printed with its label, age, and branch, followed by the matching line
+// snippets (file:line and the ± diff text).
+//
+// It returns the process exit code: 0 when the search ran (including the
+// no-matches case, which is reported but not an error), 2 on bad flags or a
+// missing/empty term (or an un-compilable --regex pattern), and 1 on a git or
+// repo failure.
+func runSearch(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("stash-stash search", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fmt.Fprintf(stderr, "stash-stash search \u2014 grep across every stash's contents at once.\n\n")
+		fmt.Fprintf(stderr, "Usage:\n  stash-stash search <term> [--regex]\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	useRegex := fs.Bool("regex", false, "treat <term> as a regular expression (still case-insensitive by default)")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+
+	// Join the remaining args so an unquoted multi-word term still works
+	// (`search foo bar` searches for "foo bar"); an empty term is a usage error.
+	term := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if term == "" {
+		fmt.Fprintln(stderr, "stash-stash search: missing search term.\n\nUsage:\n  stash-stash search <term> [--regex]")
+		return 2
+	}
+
+	// Build the matcher. A bad regex is a user error (exit 2), reported with
+	// regexp's own message so it's actionable.
+	var matcher search.Matcher
+	if *useRegex {
+		rm, err := search.Regexp(term)
+		if err != nil {
+			fmt.Fprintf(stderr, "stash-stash search: invalid --regex pattern: %v\n", err)
+			return 2
+		}
+		matcher = rm
+	} else {
+		matcher = search.Literal(term)
+	}
+
+	ctx := context.Background()
+
+	stashes, err := gitList(ctx)
+	if err != nil {
+		if errors.Is(err, git.ErrNotARepo) {
+			fmt.Fprintln(stderr, "stash-stash: not a git repository (run me inside one).")
+			return 1
+		}
+		fmt.Fprintf(stderr, "stash-stash: %v\n", err)
+		return 1
+	}
+
+	if len(stashes) == 0 {
+		fmt.Fprintln(stdout, "No stashes found. Your graveyard is empty \u2014 nothing to search. \U0001FAA6")
+		return 0
+	}
+
+	// Enrich with sidecar labels so each hit shows a human name in its header.
+	// Metadata is best-effort: a sidecar problem must never stop a search, so a
+	// load error is reported to stderr and we continue with raw subjects.
+	loadAndApplyMeta(ctx, stashes, stderr)
+
+	// Scan each stash's patch. A per-stash Show failure is non-fatal: that stash
+	// is skipped (with a stderr note) rather than aborting the whole search, so
+	// one odd entry can't hide matches in the others.
+	var hits []render.SearchHit
+	for i := range stashes {
+		patch, serr := gitShow(ctx, stashes[i].Ref())
+		if serr != nil {
+			if errors.Is(serr, git.ErrNotARepo) {
+				// The repo vanished mid-search; surface it as a real failure.
+				fmt.Fprintln(stderr, "stash-stash: not a git repository (run me inside one).")
+				return 1
+			}
+			fmt.Fprintf(stderr, "stash-stash: skipping %s (%v).\n", stashes[i].Ref(), serr)
+			continue
+		}
+		if ms := search.Scan(patch, matcher); len(ms) > 0 {
+			hits = append(hits, render.SearchHit{Stash: stashes[i], Matches: ms})
+		}
+	}
+
+	if _, err := render.SearchResults(stdout, hits, term, now()); err != nil {
+		fmt.Fprintf(stderr, "stash-stash: rendering search results: %v\n", err)
+		return 1
+	}
 	return 0
 }
