@@ -100,6 +100,61 @@ func TestTableStaleDisabled(t *testing.T) {
 	}
 }
 
+func TestTableAutoLabel(t *testing.T) {
+	now := time.Date(2026, 6, 17, 12, 0, 0, 0, time.UTC)
+	stashes := []model.Stash{
+		// No user label, but branch + top file → auto-label "payments: retry".
+		{Index: 0, SHA: "a", Subject: "WIP on feature/payments: a1b2c3d",
+			Branch: "feature/payments", TopFile: "internal/retry.go", Created: now.Add(-1 * time.Hour)},
+		// Explicit user label must NOT be marked as auto.
+		{Index: 1, SHA: "b", Subject: "WIP on main: x", Label: "typed name",
+			Branch: "main", TopFile: "main.go", Created: now.Add(-1 * time.Hour)},
+	}
+
+	var buf bytes.Buffer
+	if err := Table(&buf, stashes, now, 14); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	out := buf.String()
+
+	if !strings.Contains(out, "payments: retry ~") {
+		t.Errorf("auto-labeled row should show \"payments: retry ~\":\n%s", out)
+	}
+	if !strings.Contains(out, "~ = auto-label") {
+		t.Errorf("expected auto-label legend when an auto-label is shown:\n%s", out)
+	}
+	// The auto-label replaces the raw subject.
+	if strings.Contains(out, "a1b2c3d") {
+		t.Errorf("auto-labeled stash still shows raw subject:\n%s", out)
+	}
+	// The user-labeled row keeps its name and is not marked with "~".
+	if !strings.Contains(out, "typed name") {
+		t.Errorf("user label missing:\n%s", out)
+	}
+	if strings.Contains(out, "typed name ~") {
+		t.Errorf("user label wrongly marked as auto-label:\n%s", out)
+	}
+}
+
+func TestTableNoAutoLabelLegendWhenNone(t *testing.T) {
+	now := time.Date(2026, 6, 17, 12, 0, 0, 0, time.UTC)
+	// No top file anywhere → no auto-labels → no "~" legend, subjects shown.
+	stashes := []model.Stash{
+		{Index: 0, SHA: "a", Subject: "WIP on main: raw", Branch: "main", Created: now.Add(-1 * time.Hour)},
+	}
+	var buf bytes.Buffer
+	if err := Table(&buf, stashes, now, 14); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "~ = auto-label") {
+		t.Errorf("unexpected auto-label legend when nothing is auto-labeled:\n%s", out)
+	}
+	if !strings.Contains(out, "WIP on main: raw") {
+		t.Errorf("row without branch+file should fall back to the subject:\n%s", out)
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	cases := []struct {
 		in   string

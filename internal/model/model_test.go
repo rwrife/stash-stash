@@ -39,6 +39,50 @@ func TestDisplayPrefersLabel(t *testing.T) {
 	}
 }
 
+// --- issue #7: auto-label fallback + source ------------------------------
+
+func TestDisplaySourcePrecedence(t *testing.T) {
+	// User label wins over everything (even when an auto-label could be built).
+	user := Stash{Subject: "WIP on main: raw", Label: "my name", Branch: "feature/x", TopFile: "a.go"}
+	if got, src := user.DisplaySource(); got != "my name" || src != LabelUser {
+		t.Errorf("DisplaySource() user = (%q,%v), want (\"my name\",LabelUser)", got, src)
+	}
+
+	// No user label but branch+file present → auto-label.
+	auto := Stash{Subject: "WIP on feature/payments: raw", Branch: "feature/payments", TopFile: "internal/retry.go"}
+	if got, src := auto.DisplaySource(); got != "payments: retry" || src != LabelAuto {
+		t.Errorf("DisplaySource() auto = (%q,%v), want (\"payments: retry\",LabelAuto)", got, src)
+	}
+
+	// Nothing to derive from → raw subject.
+	none := Stash{Subject: "WIP on main: raw"}
+	if got, src := none.DisplaySource(); got != "WIP on main: raw" || src != LabelNone {
+		t.Errorf("DisplaySource() none = (%q,%v), want (subject,LabelNone)", got, src)
+	}
+}
+
+func TestAutoLabelIsDerivedNotPersisted(t *testing.T) {
+	// AutoLabel reflects branch+file even when a user label is set (so callers
+	// can surface the guess); it never reads Label.
+	s := Stash{Label: "explicit", Branch: "fix/cache", TopFile: "store.go"}
+	if got := s.AutoLabel(); got != "cache: store" {
+		t.Errorf("AutoLabel() = %q, want \"cache: store\"", got)
+	}
+	// Display still prefers the explicit label.
+	if got := s.Display(); got != "explicit" {
+		t.Errorf("Display() = %q, want the explicit user label", got)
+	}
+}
+
+func TestLabelSourceString(t *testing.T) {
+	cases := map[LabelSource]string{LabelNone: "subject", LabelUser: "user", LabelAuto: "auto"}
+	for k, want := range cases {
+		if got := k.String(); got != want {
+			t.Errorf("LabelSource(%d).String() = %q, want %q", k, got, want)
+		}
+	}
+}
+
 func TestDiffstatString(t *testing.T) {
 	cases := []struct {
 		name string

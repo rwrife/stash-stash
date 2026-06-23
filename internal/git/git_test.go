@@ -176,13 +176,61 @@ func TestDiffstatEmpty(t *testing.T) {
 	}
 }
 
+// --- issue #7: top-file detection feeding auto-labels --------------------
+
+func TestParseNumstatPicksHighestChurnTopFile(t *testing.T) {
+	// docs/README.md has the most churn (40) so it wins over the .go files,
+	// even though it isn't first in the list.
+	out := "12\t3\tcmd/main.go\n" +
+		"30\t10\tdocs/README.md\n" +
+		"4\t0\tinternal/x/x.go\n"
+	ds, top := parseNumstat([]byte(out))
+	if ds.Files != 3 {
+		t.Fatalf("files = %d, want 3", ds.Files)
+	}
+	if top != "docs/README.md" {
+		t.Errorf("top file = %q, want docs/README.md (highest churn)", top)
+	}
+}
+
+func TestParseNumstatTopFileTieKeepsFirst(t *testing.T) {
+	// Equal churn (7) for both: the first-listed file wins (stable order).
+	out := "5\t2\tfirst.go\n" +
+		"3\t4\tsecond.go\n"
+	_, top := parseNumstat([]byte(out))
+	if top != "first.go" {
+		t.Errorf("top file = %q, want first.go (tie keeps first)", top)
+	}
+}
+
+func TestParseNumstatBinaryOnlyTopFile(t *testing.T) {
+	// Only a binary change: it becomes the top file since there's no text edit.
+	_, top := parseNumstat([]byte("-\t-\tlogo.png\n"))
+	if top != "logo.png" {
+		t.Errorf("top file = %q, want logo.png (only change)", top)
+	}
+}
+
+func TestParseNumstatTextBeatsBinaryForTopFile(t *testing.T) {
+	// A binary file listed first must not beat a real text edit as the hint.
+	out := "-\t-\tlogo.png\n" +
+		"1\t0\tnote.txt\n"
+	_, top := parseNumstat([]byte(out))
+	if top != "note.txt" {
+		t.Errorf("top file = %q, want note.txt (text beats binary)", top)
+	}
+}
+
 func TestParseNumstatSkipsMalformed(t *testing.T) {
 	out := "\n" + // blank
 		"only-two\tfields\n" + // too few tabs
 		"7\t2\tgood.go\n" // valid
-	ds := parseNumstat([]byte(out))
+	ds, top := parseNumstat([]byte(out))
 	if ds.Files != 1 || ds.Added != 7 || ds.Deleted != 2 {
 		t.Errorf("parseNumstat skipped wrong lines: %+v", ds)
+	}
+	if top != "good.go" {
+		t.Errorf("top file = %q, want good.go (only valid line)", top)
 	}
 }
 
@@ -205,6 +253,9 @@ func TestEnrichDiffstatsAttachesStats(t *testing.T) {
 	for i, s := range stashes {
 		if s.Diffstat.Added != 5 || s.Diffstat.Deleted != 1 || s.Diffstat.Files != 1 {
 			t.Errorf("stash[%d].Diffstat = %+v, want +5 -1 / 1 file", i, s.Diffstat)
+		}
+		if s.TopFile != "file.go" {
+			t.Errorf("stash[%d].TopFile = %q, want file.go", i, s.TopFile)
 		}
 	}
 }

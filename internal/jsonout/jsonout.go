@@ -29,20 +29,28 @@ type Diffstat struct {
 // consumers can apply their own thresholds; Age is the same humanized token the
 // table shows; Stale is true when the stash counts as gathering dust under the
 // active threshold; Staleness is the bucket name ("fresh"/"aging"/"stale"/
-// "ancient").
+// "ancient"). Display is the label stash-stash would show (user label, else the
+// auto-derived "<area>: <hint>", else the subject) and LabelSource says which
+// of those it is ("user"/"auto"/"subject"); AutoLabel is always the derived
+// guess (when one can be built) regardless of whether a user label overrides it,
+// so scripts can surface or apply it.
 type Stash struct {
-	Index      int       `json:"index"`
-	Ref        string    `json:"ref"`
-	SHA        string    `json:"sha"`
-	Label      string    `json:"label,omitempty"`
-	Subject    string    `json:"subject"`
-	Branch     string    `json:"branch,omitempty"`
-	Created    time.Time `json:"created"`
-	Age        string    `json:"age"`
-	AgeSeconds int64     `json:"age_seconds"`
-	Staleness  string    `json:"staleness"`
-	Stale      bool      `json:"stale"`
-	Diffstat   Diffstat  `json:"diffstat"`
+	Index       int       `json:"index"`
+	Ref         string    `json:"ref"`
+	SHA         string    `json:"sha"`
+	Label       string    `json:"label,omitempty"`
+	AutoLabel   string    `json:"auto_label,omitempty"`
+	Display     string    `json:"display"`
+	LabelSource string    `json:"label_source"`
+	Subject     string    `json:"subject"`
+	Branch      string    `json:"branch,omitempty"`
+	TopFile     string    `json:"top_file,omitempty"`
+	Created     time.Time `json:"created"`
+	Age         string    `json:"age"`
+	AgeSeconds  int64     `json:"age_seconds"`
+	Staleness   string    `json:"staleness"`
+	Stale       bool      `json:"stale"`
+	Diffstat    Diffstat  `json:"diffstat"`
 }
 
 // Output is the top-level JSON document: the active stale threshold, a summary,
@@ -76,18 +84,23 @@ func Write(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) err
 		if dusty {
 			out.DustyCount++
 		}
+		display, srcKind := s.DisplaySource()
 		out.Stashes = append(out.Stashes, Stash{
-			Index:      s.Index,
-			Ref:        s.Ref(),
-			SHA:        s.SHA,
-			Label:      s.Label,
-			Subject:    s.Subject,
-			Branch:     s.Branch,
-			Created:    s.Created.UTC(),
-			Age:        age.Humanize(s.Created, now),
-			AgeSeconds: ageSecs,
-			Staleness:  bucket.String(),
-			Stale:      dusty,
+			Index:       s.Index,
+			Ref:         s.Ref(),
+			SHA:         s.SHA,
+			Label:       s.Label,
+			AutoLabel:   s.AutoLabel(),
+			Display:     display,
+			LabelSource: srcKind.String(),
+			Subject:     s.Subject,
+			Branch:      s.Branch,
+			TopFile:     s.TopFile,
+			Created:     s.Created.UTC(),
+			Age:         age.Humanize(s.Created, now),
+			AgeSeconds:  ageSecs,
+			Staleness:   bucket.String(),
+			Stale:       dusty,
 			Diffstat: Diffstat{
 				Added:   s.Diffstat.Added,
 				Deleted: s.Diffstat.Deleted,

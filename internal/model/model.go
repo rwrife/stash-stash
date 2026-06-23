@@ -6,7 +6,11 @@
 // and — in later milestones — a diffstat.
 package model
 
-import "time"
+import (
+	"time"
+
+	"github.com/rwrife/stash-stash/internal/autolabel"
+)
 
 // Diffstat summarizes how much a stash changes: how many lines were added and
 // removed and how many files were touched. It is derived from
@@ -88,21 +92,79 @@ type Stash struct {
 	Created time.Time
 
 	// Label is the human-friendly name from sidecar metadata (M4), matched by
-	// SHA. Empty when the stash has no stored label; callers fall back to
-	// Subject for display.
+	// SHA. Empty when the stash has no stored label; callers fall back to an
+	// auto-derived label (see AutoLabel) and then the raw Subject for display.
 	Label string
+
+	// TopFile is the stash's most significant changed file path, used to derive
+	// an auto-label when no explicit Label exists (issue #7). It is populated by
+	// git.EnrichDiffstats alongside Diffstat (same `git stash show --numstat`
+	// call) and is empty for a metadata-only stash or before enrichment.
+	TopFile string
 
 	// Diffstat summarizes the stash's size (M4). Zero until computed.
 	Diffstat Diffstat
 }
 
-// Display returns the best human label for the stash: the sidecar Label when
-// set, otherwise the raw git Subject. This keeps list/table rendering DRY.
-func (s Stash) Display() string {
-	if s.Label != "" {
-		return s.Label
+// AutoLabel returns a derived "<area>: <hint>" label built from the origin
+// Branch and the TopFile, used for display when the stash has no explicit
+// sidecar Label (issue #7). It returns "" when neither signal is available, so
+// callers fall back to the raw Subject. Auto-labels are advisory and never
+// persisted: they are recomputed on demand and callers style them distinctly
+// (e.g. dim/italic) so a guess is visibly different from a user-chosen name.
+func (s Stash) AutoLabel() string {
+	return autolabel.Derive(s.Branch, s.TopFile)
+}
+
+// LabelSource describes which kind of label Display() returned, so renderers
+// and the JSON output can distinguish a user-chosen label from an auto-derived
+// guess (or the raw git subject fallback).
+type LabelSource int
+
+const (
+	// LabelNone means Display() fell back to the raw git Subject.
+	LabelNone LabelSource = iota
+	// LabelUser means Display() returned an explicit sidecar Label.
+	LabelUser
+	// LabelAuto means Display() returned an auto-derived "<area>: <hint>".
+	LabelAuto
+)
+
+// String renders the source as a short, stable token ("user"/"auto"/"subject")
+// suitable for the --json output and diagnostics.
+func (k LabelSource) String() string {
+	switch k {
+	case LabelUser:
+		return "user"
+	case LabelAuto:
+		return "auto"
+	default:
+		return "subject"
 	}
-	return s.Subject
+}
+
+// DisplaySource returns the best human label for the stash *and* where it came
+// from: the sidecar Label when set (LabelUser), otherwise an auto-derived label
+// when one can be built (LabelAuto), otherwise the raw git Subject (LabelNone).
+// It is the single source of truth for label-fallback precedence so every
+// renderer agrees.
+func (s Stash) DisplaySource() (string, LabelSource) {
+	if s.Label != "" {
+		return s.Label, LabelUser
+	}
+	if auto := s.AutoLabel(); auto != "" {
+		return auto, LabelAuto
+	}
+	return s.Subject, LabelNone
+}
+
+// Display returns the best human label for the stash: the sidecar Label when
+// set, otherwise an auto-derived "<area>: <hint>" (issue #7), otherwise the raw
+// git Subject. This keeps list/table rendering DRY; callers that need to style
+// auto-labels differently use DisplaySource instead.
+func (s Stash) Display() string {
+	text, _ := s.DisplaySource()
+	return text
 }
 
 // Ref returns the canonical git reference for the stash, e.g. "stash@{0}".

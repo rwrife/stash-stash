@@ -103,24 +103,43 @@ func Show(ctx context.Context, ref string) (string, error) {
 // Like Show it returns ErrNotARepo outside a work tree and surfaces git's own
 // error text otherwise. A stash that touches nothing yields a zero Diffstat.
 func Diffstat(ctx context.Context, ref string) (model.Diffstat, error) {
+	ds, _, err := diffstatAndTopFile(ctx, ref)
+	return ds, err
+}
+
+// diffstatAndTopFile runs `git stash show --numstat <ref>` once and returns
+// both the aggregate Diffstat and the stash's most significant changed file
+// (the "top file", used to derive an auto-label — issue #7). Sharing the single
+// git call keeps enrichment to one subprocess per stash.
+func diffstatAndTopFile(ctx context.Context, ref string) (model.Diffstat, string, error) {
 	stdout, stderr, err := runner(ctx, "stash", "show", "--numstat", ref)
 	if err != nil {
 		if isNotARepo(stderr) {
-			return model.Diffstat{}, ErrNotARepo
+			return model.Diffstat{}, "", ErrNotARepo
 		}
 		if msg := strings.TrimSpace(string(stderr)); msg != "" {
-			return model.Diffstat{}, fmt.Errorf("git stash show --numstat %s: %s", ref, msg)
+			return model.Diffstat{}, "", fmt.Errorf("git stash show --numstat %s: %s", ref, msg)
 		}
-		return model.Diffstat{}, fmt.Errorf("git stash show --numstat %s: %w", ref, err)
+		return model.Diffstat{}, "", fmt.Errorf("git stash show --numstat %s: %w", ref, err)
 	}
-	return parseNumstat(stdout), nil
+	ds, top := parseNumstat(stdout)
+	return ds, top, nil
 }
 
-// parseNumstat turns `git diff --numstat` style output into a Diffstat.
-// Each non-blank line is "<added>\t<deleted>\t<path>"; binary files use "-"
-// for the counts. Malformed lines are skipped defensively.
-func parseNumstat(out []byte) model.Diffstat {
+// parseNumstat turns `git diff --numstat` style output into a Diffstat plus the
+// path of the "top" (most significant) changed file. Each non-blank line is
+// "<added>\t<deleted>\t<path>"; binary files use "-" for the counts. Malformed
+// lines are skipped defensively.
+//
+// The top file is the one with the greatest added+deleted churn; ties keep the
+// first one seen (git lists files in a stable order). A binary-only change has
+// no line counts, so a binary file only becomes "top" when no text file has any
+// churn — preferring a meaningful text edit as the auto-label hint.
+func parseNumstat(out []byte) (model.Diffstat, string) {
 	var ds model.Diffstat
+	var topFile string
+	bestChurn := -1
+	sawTextFile := false
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -133,19 +152,34 @@ func parseNumstat(out []byte) model.Diffstat {
 			continue
 		}
 		ds.Files++
+		path := strings.TrimSpace(parts[2])
 		addTok, delTok := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
 		if addTok == "-" || delTok == "-" {
 			ds.Binary = true
+			// Binary file: no churn signal. Only adopt it as the top file if we
+			// have not seen any text file at all yet, so a real edit always wins.
+			if !sawTextFile && topFile == "" {
+				topFile = path
+			}
 			continue
 		}
+		added, deleted := 0, 0
 		if n, perr := strconv.Atoi(addTok); perr == nil {
-			ds.Added += n
+			added = n
 		}
 		if n, perr := strconv.Atoi(delTok); perr == nil {
-			ds.Deleted += n
+			deleted = n
+		}
+		ds.Added += added
+		ds.Deleted += deleted
+		churn := added + deleted
+		if !sawTextFile || churn > bestChurn {
+			sawTextFile = true
+			bestChurn = churn
+			topFile = path
 		}
 	}
-	return ds
+	return ds, topFile
 }
 
 // parseList turns the raw `git stash list --format` output into Stash structs.
@@ -337,20 +371,22 @@ func noChangesToStash(stdout []byte) bool {
 	return strings.Contains(strings.ToLower(string(stdout)), "no local changes to save")
 }
 
-// EnrichDiffstats computes and attaches a Diffstat to each stash in place (M4).
+// EnrichDiffstats computes and attaches a Diffstat and the top changed file to
+// each stash in place (M4; TopFile added for auto-labels in issue #7).
 //
 // It runs one `git stash show --numstat` per stash. A per-stash failure is
-// non-fatal: that entry simply keeps a zero Diffstat so a single odd stash
-// can't blank out the whole list. An ErrNotARepo from the first call is
-// surfaced (the caller is outside a work tree); other errors are swallowed
-// per entry. Returns the (same, mutated) slice for convenience.
+// non-fatal: that entry simply keeps a zero Diffstat (and empty TopFile) so a
+// single odd stash can't blank out the whole list. An ErrNotARepo from the
+// first call is surfaced (the caller is outside a work tree); other errors are
+// swallowed per entry. Returns the (same, mutated) slice for convenience.
 func EnrichDiffstats(ctx context.Context, stashes []model.Stash) []model.Stash {
 	for i := range stashes {
-		ds, err := Diffstat(ctx, stashes[i].Ref())
+		ds, top, err := diffstatAndTopFile(ctx, stashes[i].Ref())
 		if err != nil {
 			continue
 		}
 		stashes[i].Diffstat = ds
+		stashes[i].TopFile = top
 	}
 	return stashes
 }

@@ -117,6 +117,10 @@ var (
 	// rather than the raw git subject.
 	labelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("222"))
 
+	// autoLabelStyle renders an auto-derived label (issue #7) dim + italic so it
+	// is visibly a guess, not a name the user typed (which uses labelStyle).
+	autoLabelStyle = lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("245"))
+
 	// statStyle dims the diffstat token in the list.
 	statStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("108"))
 
@@ -791,13 +795,17 @@ func (m Model) formatRow(s model.Stash) string {
 		head += "  " + statStyle.Render(stat)
 	}
 
-	// Second line: the human label if present (highlighted), else the raw
-	// git subject.
+	// Second line: the human label if present (highlighted), an auto-derived
+	// label (dim + italic, so it reads as a guess), else the raw git subject.
+	labelText, src := s.DisplaySource()
 	var subj string
-	if s.Label != "" {
-		subj = labelStyle.Render(truncate(s.Label, m.listInnerW))
-	} else {
-		subj = truncate(s.Subject, m.listInnerW)
+	switch src {
+	case model.LabelUser:
+		subj = labelStyle.Render(truncate(labelText, m.listInnerW))
+	case model.LabelAuto:
+		subj = autoLabelStyle.Render(truncate(labelText, m.listInnerW))
+	default:
+		subj = truncate(labelText, m.listInnerW)
 	}
 	br := branchStyle.Render(truncate("⎇ "+branch, m.listInnerW))
 

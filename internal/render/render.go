@@ -52,7 +52,8 @@ func Banner(stashes []model.Stash, now time.Time, staleDays int) string {
 // When staleDays > 0 it first prints a "gathering dust" banner (if any stash is
 // dusty) and flags stale rows with a trailing "*" on the age token.
 // Columns: AGE | INDEX | LABEL | BRANCH | CHANGES. LABEL is the sidecar label
-// when set, otherwise the raw git subject.
+// when set, otherwise an auto-derived "<area>: <hint>" (flagged with a trailing
+// "~" since plain text can't italicize it), otherwise the raw git subject.
 func Table(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) error {
 	banner := Banner(stashes, now, staleDays)
 	if banner != "" {
@@ -67,6 +68,7 @@ func Table(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) err
 		return err
 	}
 
+	sawAuto := false
 	for _, s := range stashes {
 		branch := s.Branch
 		if branch == "" {
@@ -82,10 +84,18 @@ func Table(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) err
 		if age.Classify(s.Created, now, staleDays).Dusty() {
 			ageTok += "*"
 		}
+		// Auto-derived labels get a trailing "~" so the plain table distinguishes
+		// a guess from a typed name (the TUI uses italics for the same purpose).
+		label, src := s.DisplaySource()
+		label = truncate(label, maxLabelWidth)
+		if src == model.LabelAuto {
+			sawAuto = true
+			label += " ~"
+		}
 		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
 			ageTok,
 			"stash@{"+strconv.Itoa(s.Index)+"}",
-			truncate(s.Display(), maxLabelWidth),
+			label,
 			branch,
 			changes,
 		); err != nil {
@@ -97,10 +107,15 @@ func Table(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) err
 		return err
 	}
 
-	// Legend only when we actually flagged something, so clean output stays
-	// uncluttered.
+	// Legends only when we actually flagged something, so clean output stays
+	// uncluttered. Staleness and auto-label legends are independent.
 	if banner != "" {
 		if _, err := fmt.Fprintf(w, "\n(* = stale: older than %dd)\n", staleDays); err != nil {
+			return err
+		}
+	}
+	if sawAuto {
+		if _, err := fmt.Fprintln(w, "(~ = auto-label from branch + top file; run `stash-stash push -m` or `l` to name it)"); err != nil {
 			return err
 		}
 	}
