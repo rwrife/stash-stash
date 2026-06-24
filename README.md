@@ -13,7 +13,7 @@ gently nags you to revive or bury the stashes rotting at the bottom.
 │   [wip] half-done modal             5d    feature/x +88 -1  4f   │
 │   experiment: swap json lib         23d   main      +4  -4  1f   │
 └──────────────────────────────────────────────────────────────────┘
-  ↑/↓ move · enter preview · a apply · p pop · d drop · l label · q quit
+  ↑/↓ move · enter preview · a apply · p pop · d drop · b branch · l label · q quit
 ```
 
 ## Why
@@ -62,7 +62,9 @@ go build -o stash-stash ./cmd/stash-stash
 > git subject — plus a **diffstat**. `l` (re)labels the selected stash; labels are keyed by content SHA so they survive
 > pop/push reordering. **You can act on stashes**: `a` applies, `p` pops, and
 > `d` drops the selected stash — pop and drop ask for a `y/N` confirm first, and
-> the sidecar is kept in sync on every mutation. `stash-stash push -m "label"`
+> the sidecar is kept in sync on every mutation. **`b` promotes a stash to a
+> branch** (`git stash branch`) using a slugified version of its label as the
+> suggested branch name. `stash-stash push -m "label"`
 > stashes your working tree and records the label immediately. Stashes older
 > than `--stale-days` (default 14) are **flagged as "gathering dust"** with a
 > header banner and colored ages. Piped or non-TTY output (and `--no-tui`)
@@ -94,8 +96,9 @@ Run `stash-stash` inside a repo with stashes and you get a two-pane browser:
 
 Keys: `↑`/`↓` (or `j`/`k`) to select · `g`/`G` jump to top/bottom · **`l` to
 (re)label** the selected stash (`⏎` saves, `esc` cancels) · **`a` apply ·
-`p` pop · `d` drop** the selected stash · `⏎`/`space`/`PgDn` and `PgUp` to
-scroll the diff · `q` / `Ctrl-C` / `Esc` to quit. The layout is resize-aware.
+`p` pop · `d` drop** the selected stash · **`b` branch** (promote it to a new
+branch) · `⏎`/`space`/`PgDn` and `PgUp` to scroll the diff · `q` / `Ctrl-C` /
+`Esc` to quit. The layout is resize-aware.
 
 **Actions are safe by default.** `a` (apply) is non-destructive and runs
 immediately. `p` (pop) and `d` (drop) move or delete work, so they pop a
@@ -104,6 +107,22 @@ pop or drop the list resyncs with git and the sidecar entry for the removed
 stash is pruned, so labels never drift. Git's own errors (e.g. a conflicting
 apply) are surfaced verbatim in a status toast, and the stash is left in place
 so you can resolve it.
+
+### Promote a stash to a branch
+
+Got a dusty stash you actually want to finish? Press **`b`** to turn it into a
+real branch. stash-stash opens a one-line editor pre-filled with a **slugified
+branch name** derived from the stash's label (e.g. a stash labeled
+`payments: fix retry` suggests `payments-fix-retry`) — edit it or accept it,
+then `⏎` to create the branch (`esc` cancels).
+
+Under the hood this runs `git stash branch <name> <stash>`, which creates the
+branch off the commit the stash was *based on*, checks it out, and applies the
+stash there. Applying on the original base is the trick: it sidesteps the
+spurious conflicts you'd hit applying onto an unrelated `HEAD`. On success the
+stash is consumed, so — just like pop/drop — the list resyncs and the sidecar
+entry is pruned. If the apply conflicts or the branch name already exists, git's
+message is surfaced in a toast and the stash is left untouched.
 
 ### Stashing with a label that sticks
 

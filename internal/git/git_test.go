@@ -345,6 +345,72 @@ func TestDropNotARepo(t *testing.T) {
 	}
 }
 
+func TestBranchArgs(t *testing.T) {
+	var gotArgs []string
+	stubRunnerFunc(t, func(args ...string) ([]byte, []byte, error) {
+		gotArgs = args
+		return nil, nil, nil
+	})
+	if err := Branch(context.Background(), "payments-retry", "stash@{1}"); err != nil {
+		t.Fatalf("Branch() error = %v", err)
+	}
+	want := "stash branch payments-retry stash@{1}"
+	if strings.Join(gotArgs, " ") != want {
+		t.Errorf("Branch args = %v, want %q", gotArgs, want)
+	}
+}
+
+func TestBranchTrimsName(t *testing.T) {
+	var gotArgs []string
+	stubRunnerFunc(t, func(args ...string) ([]byte, []byte, error) {
+		gotArgs = args
+		return nil, nil, nil
+	})
+	if err := Branch(context.Background(), "  spaced  ", "stash@{0}"); err != nil {
+		t.Fatalf("Branch() error = %v", err)
+	}
+	// Surrounding whitespace is trimmed; the name token must not carry spaces.
+	if strings.Join(gotArgs, " ") != "stash branch spaced stash@{0}" {
+		t.Errorf("Branch args = %v, want a trimmed name", gotArgs)
+	}
+}
+
+func TestBranchEmptyNameRejected(t *testing.T) {
+	called := false
+	stubRunnerFunc(t, func(args ...string) ([]byte, []byte, error) {
+		called = true
+		return nil, nil, nil
+	})
+	err := Branch(context.Background(), "   ", "stash@{0}")
+	if !errors.Is(err, ErrEmptyBranchName) {
+		t.Fatalf("Branch() err = %v, want ErrEmptyBranchName", err)
+	}
+	if called {
+		t.Error("Branch() shelled out to git despite an empty name")
+	}
+}
+
+func TestBranchSurfacesGitError(t *testing.T) {
+	stubRunner(t, "", "fatal: a branch named 'payments' already exists", errors.New("exit status 128"))
+	err := Branch(context.Background(), "payments", "stash@{0}")
+	if err == nil {
+		t.Fatal("Branch() = nil, want a git error")
+	}
+	if !strings.Contains(err.Error(), "already exists") {
+		t.Errorf("Branch() error = %q, want it to surface git's message", err)
+	}
+	if errors.Is(err, ErrNotARepo) {
+		t.Errorf("Branch() existing-branch error misreported as ErrNotARepo")
+	}
+}
+
+func TestBranchNotARepo(t *testing.T) {
+	stubRunner(t, "", "fatal: not a git repository (or any of the parent directories): .git", errors.New("exit status 128"))
+	if err := Branch(context.Background(), "feature", "stash@{0}"); !errors.Is(err, ErrNotARepo) {
+		t.Fatalf("Branch() err = %v, want ErrNotARepo", err)
+	}
+}
+
 func TestPushRecordsSHA(t *testing.T) {
 	var calls [][]string
 	stubRunnerFunc(t, func(args ...string) ([]byte, []byte, error) {

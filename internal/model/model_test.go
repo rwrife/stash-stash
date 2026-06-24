@@ -110,3 +110,37 @@ func TestDiffstatIsZero(t *testing.T) {
 		t.Error("non-empty Diffstat.IsZero() = true")
 	}
 }
+
+func TestBranchSuggestion(t *testing.T) {
+	cases := []struct {
+		name  string
+		stash Stash
+		want  string
+	}{
+		{
+			name:  "from user label",
+			stash: Stash{Index: 0, Label: "Payments: fix retry"},
+			want:  "payments-fix-retry",
+		},
+		{
+			name:  "from auto label",
+			stash: Stash{Index: 1, Branch: "feature/payments", TopFile: "internal/retry.go"},
+			want:  "payments-retry",
+		},
+		{
+			name:  "from subject when nothing else",
+			stash: Stash{Index: 2, Subject: "WIP on main: a1b2c3d"},
+			want:  "wip-on-main-a1b2c3d",
+		},
+		{
+			name:  "falls back to stash index when slug is empty",
+			stash: Stash{Index: 3, Label: "!!!"},
+			want:  "stash-3",
+		},
+	}
+	for _, c := range cases {
+		if got := c.stash.BranchSuggestion(); got != c.want {
+			t.Errorf("%s: BranchSuggestion() = %q, want %q", c.name, got, c.want)
+		}
+	}
+}

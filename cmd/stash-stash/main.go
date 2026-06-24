@@ -175,9 +175,10 @@ func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool) int {
 		// can resync after a pop/drop (indices shift). It is best-effort: a
 		// reload error is surfaced in-TUI, not fatal.
 		actions := tui.Actions{
-			Apply: git.Apply,
-			Pop:   git.Pop,
-			Drop:  git.Drop,
+			Apply:  git.Apply,
+			Pop:    git.Pop,
+			Drop:   git.Drop,
+			Branch: git.Branch,
 			Reload: func(ctx context.Context) ([]model.Stash, error) {
 				fresh, err := git.List(ctx)
 				if err != nil {

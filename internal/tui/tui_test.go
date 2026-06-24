@@ -457,6 +457,18 @@ func recordingAction(into *[]string, err error) ActionFunc {
 	}
 }
 
+// branchCall records a single git.Branch invocation for assertions.
+type branchCall struct{ name, ref string }
+
+// recordingBranch returns a BranchFunc that records the (name, ref) it was
+// called with and returns the supplied error (nil for success).
+func recordingBranch(into *[]branchCall, err error) BranchFunc {
+	return func(ctx context.Context, name, ref string) error {
+		*into = append(*into, branchCall{name: name, ref: ref})
+		return err
+	}
+}
+
 // reloadReturning returns a ReloadFunc that yields the given stashes/err.
 func reloadReturning(stashes []model.Stash, err error) ReloadFunc {
 	return func(ctx context.Context) ([]model.Stash, error) { return stashes, err }
@@ -705,5 +717,232 @@ func TestDustBannerDisabled(t *testing.T) {
 	out := stripANSI(m.View())
 	if strings.Contains(out, "gathering dust") {
 		t.Errorf("staleDays=0 must not nag:\n%s", out)
+	}
+}
+
+// --- issue #9: stash -> branch -------------------------------------------
+
+func TestBranchKeyOpensEditorWithSuggestion(t *testing.T) {
+	// stash@{1} (SHA bbb) is on branch feature/x with a label → suggestion is
+	// the slug of that label.
+	stashes := sampleStashes()
+	stashes[1].Label = "Payments: fix retry"
+	actions := Actions{Branch: recordingBranch(new([]branchCall), nil), Reload: reloadReturning(nil, nil)}
+	m := New(stashes, stubShow, newFakeStore(), actions, fixedNow, 0)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	// Move to stash@{1}, then open the branch editor with 'b'.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'j'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m = updated.(Model)
+
+	if !m.branching {
+		t.Fatal("'b' did not open the branch editor")
+	}
+	if m.editing {
+		t.Error("'b' wrongly opened the label editor too")
+	}
+	if got := m.input.Value(); got != "payments-fix-retry" {
+		t.Errorf("branch editor seeded with %q, want the slugified label", got)
+	}
+	if !strings.Contains(stripANSI(m.footer()), "branch") {
+		t.Errorf("footer = %q, want a branch prompt", stripANSI(m.footer()))
+	}
+}
+
+func TestBranchCommitFiresBranchAndResyncs(t *testing.T) {
+	var calls []branchCall
+	// Branching stash@{0} (SHA aaa) succeeds; the reload returns the remaining
+	// two stashes and the sidecar entry for aaa must be pruned.
+	remaining := []model.Stash{
+		{Index: 0, SHA: "bbb", Subject: "On feature/x: middle", Branch: "feature/x", Created: fixedNow.Add(-48 * time.Hour)},
+		{Index: 1, SHA: "ccc", Subject: "WIP on main: bottom", Branch: "main", Created: fixedNow.Add(-72 * time.Hour)},
+	}
+	store := newFakeStore()
+	store.labels["aaa"] = "doomed"
+	store.labels["bbb"] = "keeper"
+	actions := Actions{Branch: recordingBranch(&calls, nil), Reload: reloadReturning(remaining, nil)}
+
+	m := New(sampleStashes(), stubShow, store, actions, fixedNow, 0)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	// Open the editor, clear the suggestion, type a custom name, commit.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m = updated.(Model)
+	for m.input.Value() != "" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+	m = typeRunes(t, m, "revive-top")
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if !m.busy {
+		t.Error("model not marked busy while the branch runs")
+	}
+	m = runCmd(t, m, cmd)
+
+	if len(calls) != 1 || calls[0].name != "revive-top" || calls[0].ref != "stash@{0}" {
+		t.Fatalf("branch called with %+v, want name=revive-top ref=stash@{0}", calls)
+	}
+	if len(m.stashes) != 2 || m.stashes[0].SHA != "bbb" {
+		t.Fatalf("post-branch stashes = %+v, want the reloaded 2", m.stashes)
+	}
+	if _, ok := store.labels["aaa"]; ok {
+		t.Error("sidecar still has the branched stash's label; Prune did not run")
+	}
+	if _, ok := store.labels["bbb"]; !ok {
+		t.Error("Prune wrongly removed a surviving stash's label")
+	}
+	if m.busy {
+		t.Error("model still busy after the branch completed")
+	}
+	if !strings.Contains(stripANSI(m.footer()), "branched") {
+		t.Errorf("footer = %q, want a 'branched' toast", stripANSI(m.footer()))
+	}
+}
+
+func TestBranchEditCancelDiscards(t *testing.T) {
+	var calls []branchCall
+	actions := Actions{Branch: recordingBranch(&calls, nil), Reload: reloadReturning(nil, nil)}
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m = updated.(Model)
+	m = typeRunes(t, m, "throwaway")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.branching {
+		t.Error("Esc did not close the branch editor")
+	}
+	if len(calls) != 0 {
+		t.Errorf("cancelled branch still ran git: %+v", calls)
+	}
+	if !strings.Contains(stripANSI(m.footer()), "cancelled") {
+		t.Errorf("footer = %q, want a 'cancelled' notice", stripANSI(m.footer()))
+	}
+}
+
+func TestBranchEmptyNameRejected(t *testing.T) {
+	var calls []branchCall
+	actions := Actions{Branch: recordingBranch(&calls, nil), Reload: reloadReturning(nil, nil)}
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m = updated.(Model)
+	// Clear the suggestion entirely, then commit an empty name.
+	for m.input.Value() != "" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	m = runCmd(t, m, cmd)
+
+	if len(calls) != 0 {
+		t.Errorf("branch ran with an empty name: %+v", calls)
+	}
+	if m.branching {
+		t.Error("branch editor still open after empty commit")
+	}
+	if !strings.Contains(stripANSI(m.footer()), "required") {
+		t.Errorf("footer = %q, want a 'branch name required' notice", stripANSI(m.footer()))
+	}
+}
+
+func TestBranchUnavailableWithoutFunc(t *testing.T) {
+	// Zero Actions: pressing 'b' should neither open the editor nor crash.
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m = updated.(Model)
+	if m.branching {
+		t.Error("branch editor opened for an unavailable branch action")
+	}
+	if !strings.Contains(stripANSI(m.footer()), "unavailable") {
+		t.Errorf("footer = %q, want an 'unavailable' notice", stripANSI(m.footer()))
+	}
+}
+
+func TestBranchErrorSurfacesToast(t *testing.T) {
+	actions := Actions{
+		Branch: recordingBranch(new([]branchCall), testErr("CONFLICT: could not apply stash")),
+		Reload: reloadReturning(nil, nil),
+	}
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m = updated.(Model)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	m = runCmd(t, m, cmd)
+
+	foot := stripANSI(m.footer())
+	if !strings.Contains(foot, "CONFLICT") {
+		t.Errorf("footer = %q, want it to surface the branch error", foot)
+	}
+	// On error the original list is untouched.
+	if len(m.stashes) != 3 {
+		t.Errorf("stashes mutated on branch error: len=%d, want 3", len(m.stashes))
+	}
+}
+
+func TestBranchingSwallowsNavigationKeys(t *testing.T) {
+	// While branching, 'j' is text in the name field, not a cursor move.
+	actions := Actions{Branch: recordingBranch(new([]branchCall), nil), Reload: reloadReturning(nil, nil)}
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m = updated.(Model)
+	for m.input.Value() != "" {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+	m = typeRunes(t, m, "j")
+	if m.cursor != 0 {
+		t.Errorf("cursor moved to %d while branching; 'j' should be text", m.cursor)
+	}
+	if m.input.Value() != "j" {
+		t.Errorf("input = %q, want %q", m.input.Value(), "j")
+	}
+}
+
+func TestBranchLastStashShowsEmptyState(t *testing.T) {
+	// A single stash; branching it empties the list.
+	one := []model.Stash{{Index: 0, SHA: "solo", Subject: "WIP on main: only", Branch: "main", Created: fixedNow.Add(-time.Hour)}}
+	actions := Actions{Branch: recordingBranch(new([]branchCall), nil), Reload: reloadReturning(nil, nil)}
+	m := New(one, stubShow, newFakeStore(), actions, fixedNow, 0)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	m = updated.(Model)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	m = runCmd(t, m, cmd)
+
+	if len(m.stashes) != 0 {
+		t.Fatalf("stashes = %d, want 0 after branching the only one", len(m.stashes))
+	}
+	if m.loadedFor != -1 {
+		t.Errorf("loadedFor = %d, want -1 (nothing to preview)", m.loadedFor)
+	}
+}
+
+func TestHelpLineMentionsBranch(t *testing.T) {
+	m := sized(t)
+	if !strings.Contains(stripANSI(m.footer()), "b branch") {
+		t.Errorf("help line = %q, want it to mention 'b branch'", stripANSI(m.footer()))
 	}
 }
