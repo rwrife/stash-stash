@@ -17,6 +17,7 @@ import (
 
 	"github.com/rwrife/stash-stash/internal/age"
 	"github.com/rwrife/stash-stash/internal/model"
+	"github.com/rwrife/stash-stash/internal/search"
 )
 
 // maxLabelWidth keeps the table scannable; longer labels/subjects are truncated
@@ -120,6 +121,86 @@ func Table(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) err
 		}
 	}
 	return nil
+}
+
+// SearchHit pairs a stash with the matching lines found in its patch, so the
+// renderer can print a per-stash header (label · age · branch) followed by the
+// matching snippets. It is the unit returned by the command layer's scan of
+// each stash's `git stash show -p` output (issue #8).
+type SearchHit struct {
+	// Stash is the matched stash (for its label, ref, age, and branch).
+	Stash model.Stash
+	// Matches are the matching lines within that stash's patch, in patch order.
+	Matches []search.Match
+}
+
+// maxSnippetWidth keeps matching lines from blowing out a terminal; longer
+// matched lines are truncated with an ellipsis (the full diff is one
+// `stash-stash` / `git stash show` away).
+const maxSnippetWidth = 100
+
+// SearchResults writes a grouped, skimmable report of stashes whose contents
+// matched a search, using `now` to render each stash's age. For each hit it
+// prints a header line — "stash@{N}  <label>  (<age>[, <branch>])" — followed by
+// indented matching snippets of the form "<file>:<line>: <±> <text>". term is
+// echoed in the summary line so the output is self-describing in a scrollback.
+//
+// It returns the number of matching lines written across all hits (0 only when
+// hits is empty), so the caller can choose an exit message. A nil/empty hits
+// slice prints a friendly "no matches" line and returns 0.
+func SearchResults(w io.Writer, hits []SearchHit, term string, now time.Time) (int, error) {
+	if len(hits) == 0 {
+		if _, err := fmt.Fprintf(w, "No stash contents matched %q. 🔍\n", term); err != nil {
+			return 0, err
+		}
+		return 0, nil
+	}
+
+	total := 0
+	for i, hit := range hits {
+		if i > 0 {
+			if _, err := fmt.Fprintln(w); err != nil {
+				return total, err
+			}
+		}
+
+		label := truncate(hit.Stash.Display(), maxLabelWidth)
+		ageTok := age.Humanize(hit.Stash.Created, now)
+		meta := ageTok
+		if b := hit.Stash.Branch; b != "" {
+			meta = ageTok + ", " + b
+		}
+		countTok := strconv.Itoa(len(hit.Matches)) + " " + plural(len(hit.Matches), "match", "matches")
+		if _, err := fmt.Fprintf(w, "%s  %s  (%s) \u2014 %s\n",
+			hit.Stash.Ref(), label, meta, countTok); err != nil {
+			return total, err
+		}
+
+		for _, mt := range hit.Matches {
+			loc := mt.File
+			if mt.Line > 0 {
+				loc += ":" + strconv.Itoa(mt.Line)
+			}
+			if loc == "" {
+				loc = "(unknown)"
+			}
+			if _, err := fmt.Fprintf(w, "    %s: %s %s\n",
+				loc, mt.Kind.Symbol(), truncate(mt.Text, maxSnippetWidth)); err != nil {
+				return total, err
+			}
+			total++
+		}
+	}
+	return total, nil
+}
+
+// plural picks the singular or plural noun for n (kept local so this package
+// stays dependency-light, mirroring the helper in internal/model).
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // truncate shortens s to at most max runes, appending "…" when it cuts.

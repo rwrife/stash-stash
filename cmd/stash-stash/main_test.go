@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/rwrife/stash-stash/internal/git"
 	"github.com/rwrife/stash-stash/internal/meta"
+	"github.com/rwrife/stash-stash/internal/model"
 )
 
 func TestRunVersion(t *testing.T) {
@@ -190,5 +192,175 @@ func TestPushUnexpectedArg(t *testing.T) {
 	code := run([]string{"push", "-m", "label", "stray"}, &stdout, &stderr)
 	if code != 2 {
 		t.Fatalf("exit = %d, want 2 for a stray positional arg", code)
+	}
+}
+
+// --- issue #8: search subcommand ----------------------------------------
+
+// stubList swaps the indirected gitList to return a fixed stash set.
+func stubList(t *testing.T, stashes []model.Stash, err error) {
+	t.Helper()
+	orig := gitList
+	gitList = func(ctx context.Context) ([]model.Stash, error) {
+		return stashes, err
+	}
+	t.Cleanup(func() { gitList = orig })
+}
+
+// stubShow swaps the indirected gitShow to return a patch per stash ref.
+func stubShow(t *testing.T, patches map[string]string, err error) {
+	t.Helper()
+	orig := gitShow
+	gitShow = func(ctx context.Context, ref string) (string, error) {
+		if err != nil {
+			return "", err
+		}
+		return patches[ref], nil
+	}
+	t.Cleanup(func() { gitShow = orig })
+}
+
+func TestSearchFindsMatchesAcrossStashes(t *testing.T) {
+	stubList(t, []model.Stash{
+		{Index: 0, SHA: "aaa", Subject: "WIP on main: a", Branch: "main"},
+		{Index: 1, SHA: "bbb", Subject: "On feature/x: b", Branch: "feature/x"},
+	}, nil)
+	stubShow(t, map[string]string{
+		"stash@{0}": "--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,2 @@\n other\n+added retry budget\n",
+		"stash@{1}": "--- a/b.txt\n+++ b/b.txt\n@@ -1,1 +1,1 @@\n-no relevant change\n+still nothing\n",
+	}, nil)
+	tempRepoSidecar(t) // metaLoad -> empty store (no labels), best-effort.
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"search", "retry"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "stash@{0}") || !strings.Contains(out, "added retry budget") {
+		t.Errorf("stdout = %q, want the matching stash + snippet", out)
+	}
+	if strings.Contains(out, "stash@{1}") {
+		t.Errorf("stdout = %q, want stash@{1} (no match) omitted", out)
+	}
+}
+
+func TestSearchCaseInsensitiveByDefault(t *testing.T) {
+	stubList(t, []model.Stash{{Index: 0, SHA: "aaa", Subject: "WIP on main: a", Branch: "main"}}, nil)
+	stubShow(t, map[string]string{
+		"stash@{0}": "--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+RETRY in caps\n",
+	}, nil)
+	tempRepoSidecar(t)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"search", "retry"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(stdout.String(), "RETRY in caps") {
+		t.Errorf("case-insensitive search missed an uppercase hit:\n%s", stdout.String())
+	}
+}
+
+func TestSearchRegexFlag(t *testing.T) {
+	stubList(t, []model.Stash{{Index: 0, SHA: "aaa", Subject: "WIP on main: a", Branch: "main"}}, nil)
+	stubShow(t, map[string]string{
+		"stash@{0}": "--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n+retry budget = 5\n+totally unrelated\n",
+	}, nil)
+	tempRepoSidecar(t)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"search", "--regex", `retry.*=.*[0-9]`}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "retry budget = 5") {
+		t.Errorf("regex search missed the budget line:\n%s", out)
+	}
+	if strings.Contains(out, "totally unrelated") {
+		t.Errorf("regex search matched an unrelated line:\n%s", out)
+	}
+}
+
+func TestSearchNoMatchesIsExitZero(t *testing.T) {
+	stubList(t, []model.Stash{{Index: 0, SHA: "aaa", Subject: "WIP on main: a", Branch: "main"}}, nil)
+	stubShow(t, map[string]string{
+		"stash@{0}": "--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-x\n+y\n",
+	}, nil)
+	tempRepoSidecar(t)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"search", "definitely-absent"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 for no matches", code)
+	}
+	if !strings.Contains(stdout.String(), "No stash contents matched") {
+		t.Errorf("stdout = %q, want a friendly no-match line", stdout.String())
+	}
+}
+
+func TestSearchEmptyStackIsExitZero(t *testing.T) {
+	stubList(t, nil, nil)
+	// gitShow must not be called; stub it to fail loudly if it is.
+	stubShow(t, nil, errors.New("show should not be called for an empty stack"))
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"search", "anything"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 for empty stack", code)
+	}
+	if !strings.Contains(stdout.String(), "No stashes found") {
+		t.Errorf("stdout = %q, want an empty-graveyard note", stdout.String())
+	}
+}
+
+func TestSearchMissingTerm(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"search"}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 for a missing term", code)
+	}
+	if !strings.Contains(stderr.String(), "missing search term") {
+		t.Errorf("stderr = %q, want a missing-term usage error", stderr.String())
+	}
+}
+
+func TestSearchInvalidRegex(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"search", "--regex", "("}, &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 for a bad regex", code)
+	}
+	if !strings.Contains(stderr.String(), "invalid --regex pattern") {
+		t.Errorf("stderr = %q, want a regex compile error", stderr.String())
+	}
+}
+
+func TestSearchNotARepo(t *testing.T) {
+	stubList(t, nil, git.ErrNotARepo)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"search", "x"}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 outside a repo", code)
+	}
+	if !strings.Contains(stderr.String(), "not a git repository") {
+		t.Errorf("stderr = %q, want a not-a-repo message", stderr.String())
+	}
+}
+
+func TestSearchMultiWordTerm(t *testing.T) {
+	// Unquoted multi-word terms join into a single phrase search.
+	stubList(t, []model.Stash{{Index: 0, SHA: "aaa", Subject: "WIP on main: a", Branch: "main"}}, nil)
+	stubShow(t, map[string]string{
+		"stash@{0}": "--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-x\n+retry budget grew\n",
+	}, nil)
+	tempRepoSidecar(t)
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"search", "retry", "budget"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(stdout.String(), "retry budget grew") {
+		t.Errorf("multi-word term search missed the line:\n%s", stdout.String())
 	}
 }

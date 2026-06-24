@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/rwrife/stash-stash/internal/model"
+	"github.com/rwrife/stash-stash/internal/search"
 )
 
 func TestTable(t *testing.T) {
@@ -170,5 +171,59 @@ func TestTruncate(t *testing.T) {
 		if got := truncate(c.in, c.max); got != c.want {
 			t.Errorf("truncate(%q, %d) = %q, want %q", c.in, c.max, got, c.want)
 		}
+	}
+}
+
+func TestSearchResults(t *testing.T) {
+	now := time.Date(2026, 6, 23, 12, 0, 0, 0, time.UTC)
+	hits := []SearchHit{
+		{
+			Stash: model.Stash{Index: 0, SHA: "deadbeef", Label: "payments: retry", Branch: "feature/payments", Created: now.Add(-2 * time.Hour)},
+			Matches: []search.Match{
+				{File: "internal/git/retry.go", Kind: search.KindAdded, Line: 11, Text: "\tretryBudget := 5"},
+				{File: "internal/git/retry.go", Kind: search.KindRemoved, Line: 11, Text: "\tretryBudget := 3"},
+			},
+		},
+		{
+			// No sidecar label: header falls back through Display() to the subject.
+			Stash:   model.Stash{Index: 2, SHA: "cafebabe", Subject: "On main: misc", Branch: "", Created: now.Add(-5 * 24 * time.Hour)},
+			Matches: []search.Match{{File: "notes.txt", Kind: search.KindContext, Line: 4, Text: "retry later"}},
+		},
+	}
+
+	var buf bytes.Buffer
+	n, err := SearchResults(&buf, hits, "retry", now)
+	if err != nil {
+		t.Fatalf("SearchResults() error = %v", err)
+	}
+	if n != 3 {
+		t.Errorf("match count = %d, want 3", n)
+	}
+	out := buf.String()
+
+	for _, want := range []string{
+		"stash@{0}", "payments: retry", "2h", "feature/payments", "2 matches",
+		"internal/git/retry.go:11: + \tretryBudget := 5",
+		"internal/git/retry.go:11: - \tretryBudget := 3",
+		"stash@{2}", "5d", "1 match",
+		"notes.txt:4:   retry later", // context line uses a space symbol
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("search results missing %q\n---\n%s", want, out)
+		}
+	}
+}
+
+func TestSearchResultsNoHits(t *testing.T) {
+	var buf bytes.Buffer
+	n, err := SearchResults(&buf, nil, "ghost", time.Now())
+	if err != nil {
+		t.Fatalf("SearchResults() error = %v", err)
+	}
+	if n != 0 {
+		t.Errorf("count = %d, want 0", n)
+	}
+	if !strings.Contains(buf.String(), `No stash contents matched "ghost"`) {
+		t.Errorf("missing no-match line:\n%s", buf.String())
 	}
 }
