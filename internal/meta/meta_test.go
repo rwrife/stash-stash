@@ -151,3 +151,67 @@ func TestSaveWithoutPathErrors(t *testing.T) {
 		t.Error("Save with no path should error")
 	}
 }
+
+// --- issue #10: orphan detection + Remove for `stash-stash doctor` ---------
+
+func TestOrphansReportsOnlyUnknownSHAs(t *testing.T) {
+	s := tempStore(t)
+	s.SetLabel("live", "on the stack")
+	s.SetLabel("recoverable", "dangling but rescuable")
+	s.SetLabel("gone", "truly lost work")
+
+	// "live" and "recoverable" are accounted for; only "gone" is an orphan.
+	known := map[string]struct{}{"live": {}, "recoverable": {}}
+	orphans := s.Orphans(known)
+	if len(orphans) != 1 {
+		t.Fatalf("Orphans len = %d, want 1 (%+v)", len(orphans), orphans)
+	}
+	if orphans[0].SHA != "gone" {
+		t.Errorf("orphan SHA = %q, want gone", orphans[0].SHA)
+	}
+	if orphans[0].Entry.Label != "truly lost work" {
+		t.Errorf("orphan label = %q, want %q", orphans[0].Entry.Label, "truly lost work")
+	}
+}
+
+func TestOrphansSortedBySHA(t *testing.T) {
+	s := tempStore(t)
+	s.SetLabel("ccc", "c")
+	s.SetLabel("aaa", "a")
+	s.SetLabel("bbb", "b")
+	orphans := s.Orphans(map[string]struct{}{}) // nothing known → all orphans
+	got := []string{orphans[0].SHA, orphans[1].SHA, orphans[2].SHA}
+	want := []string{"aaa", "bbb", "ccc"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("orphans order = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestOrphansDoesNotMutateStore(t *testing.T) {
+	s := tempStore(t)
+	s.SetLabel("gone", "lost")
+	_ = s.Orphans(map[string]struct{}{}) // reports it, must not delete it
+	if _, ok := s.Label("gone"); !ok {
+		t.Error("Orphans mutated the store (entry was removed)")
+	}
+}
+
+func TestRemoveDeletesEntry(t *testing.T) {
+	s := tempStore(t)
+	s.SetLabel("sha", "bye")
+	if !s.Remove("sha") {
+		t.Fatal("Remove returned false for an existing entry")
+	}
+	if _, ok := s.Label("sha"); ok {
+		t.Error("entry still present after Remove")
+	}
+	// Removing again (or an unknown SHA) is a no-op returning false.
+	if s.Remove("sha") {
+		t.Error("Remove of a missing SHA returned true")
+	}
+	if s.Remove("") {
+		t.Error("Remove of an empty SHA returned true")
+	}
+}

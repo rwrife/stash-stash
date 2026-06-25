@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -184,6 +185,52 @@ func (s *Store) Prune(liveSHAs map[string]struct{}) int {
 		}
 	}
 	return removed
+}
+
+// Orphan is a sidecar entry whose stash no longer exists anywhere known — not
+// on the stack and (per the caller's set) not recoverable from the reflog/fsck
+// either. `stash-stash doctor` reports these so a label for long-gone work can
+// be cleaned up deliberately rather than auto-pruned on every list.
+type Orphan struct {
+	// SHA is the content SHA the entry was keyed by.
+	SHA string
+	// Entry is the stored metadata (label/tags/note) for diagnostics.
+	Entry Entry
+}
+
+// Orphans returns the sidecar entries whose SHA is not in knownSHAs, sorted by
+// SHA for a stable report. Unlike Prune it does not mutate the store: the
+// doctor lists orphans first, then removes only what the user confirms (via
+// Remove). knownSHAs should be the union of live stash SHAs and any recoverable
+// dangling-stash SHAs, so a label for still-recoverable work is never flagged
+// as orphaned.
+func (s *Store) Orphans(knownSHAs map[string]struct{}) []Orphan {
+	if s == nil {
+		return nil
+	}
+	var out []Orphan
+	for sha, e := range s.Entries {
+		if _, ok := knownSHAs[sha]; ok {
+			continue
+		}
+		out = append(out, Orphan{SHA: sha, Entry: e})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].SHA < out[j].SHA })
+	return out
+}
+
+// Remove deletes the entry for sha from the in-memory store and reports whether
+// anything was removed. Callers must Save to persist. It is used by the doctor
+// to clean up a confirmed orphan; a missing SHA is a no-op returning false.
+func (s *Store) Remove(sha string) bool {
+	if s == nil || sha == "" {
+		return false
+	}
+	if _, ok := s.Entries[sha]; !ok {
+		return false
+	}
+	delete(s.Entries, sha)
+	return true
 }
 
 // Save writes the store to its bound path atomically (temp file + rename) so a
