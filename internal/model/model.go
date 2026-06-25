@@ -167,6 +167,19 @@ func (s Stash) Display() string {
 	return text
 }
 
+// BranchSuggestion returns a safe git branch name suggested for promoting this
+// stash to a branch (issue #9): the slug of its display label (its sidecar
+// label, else an auto-derived name, else the git subject). When that slugs to
+// nothing usable — e.g. a stash whose only "label" is punctuation — it falls
+// back to a stable "stash-<index>" so the suggestion is never empty. It is a
+// suggestion only; the user can edit it before the branch is created.
+func (s Stash) BranchSuggestion() string {
+	if slug := autolabel.Slug(s.Display()); slug != "" {
+		return slug
+	}
+	return "stash-" + itoa(s.Index)
+}
+
 // Ref returns the canonical git reference for the stash, e.g. "stash@{0}".
 func (s Stash) Ref() string {
 	return "stash@{" + itoa(s.Index) + "}"

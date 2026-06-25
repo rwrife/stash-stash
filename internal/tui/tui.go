@@ -18,6 +18,12 @@
 // successful mutation the list is reloaded from git (indices shift) and the
 // sidecar entry for a removed stash is pruned, so the metadata never drifts
 // from reality. Every action lands a transient success/error toast.
+//
+// Issue #9 adds `b`: promote the selected stash to a real branch. It opens an
+// inline editor pre-filled with a slugified branch name suggested from the
+// stash's label, then runs `git stash branch <name> <ref>`. A successful branch
+// applies and removes the stash, so (like pop/drop) the list is reloaded and the
+// sidecar entry pruned.
 package tui
 
 import (
@@ -45,6 +51,12 @@ type ShowFunc func(ctx context.Context, ref string) (string, error)
 // without a real repo.
 type ActionFunc func(ctx context.Context, ref string) error
 
+// BranchFunc promotes a stash ref to a new branch (issue #9). It mirrors
+// git.Branch (name + ref) and is injected so the model is testable without a
+// real repo. A successful call removes the stash from the stack, so the caller
+// reloads and prunes afterwards as it does for pop/drop.
+type BranchFunc func(ctx context.Context, name, ref string) error
+
 // ReloadFunc returns the current, freshly-enriched stash list (labels +
 // diffstats applied), used after a pop/drop to resync the view with git since
 // stash@{N} indices shift. It mirrors the load path in main and is injected so
@@ -58,6 +70,7 @@ type Actions struct {
 	Apply  ActionFunc
 	Pop    ActionFunc
 	Drop   ActionFunc
+	Branch BranchFunc
 	Reload ReloadFunc
 }
 
@@ -155,13 +168,14 @@ type diffLoadedMsg struct {
 }
 
 // actionKind identifies which mutating action an actionDoneMsg refers to, so
-// the toast can name it ("applied"/"popped"/"dropped").
+// the toast can name it ("applied"/"popped"/"dropped"/"branched").
 type actionKind int
 
 const (
 	actionApply actionKind = iota
 	actionPop
 	actionDrop
+	actionBranch
 )
 
 func (a actionKind) verb() string {
@@ -172,13 +186,15 @@ func (a actionKind) verb() string {
 		return "popped"
 	case actionDrop:
 		return "dropped"
+	case actionBranch:
+		return "branched"
 	default:
 		return "done"
 	}
 }
 
 // imperative returns the present-tense command word for prompts ("apply",
-// "pop", "drop").
+// "pop", "drop", "branch").
 func (a actionKind) imperative() string {
 	switch a {
 	case actionApply:
@@ -187,6 +203,8 @@ func (a actionKind) imperative() string {
 		return "pop"
 	case actionDrop:
 		return "drop"
+	case actionBranch:
+		return "branch"
 	default:
 		return "act on"
 	}
@@ -205,9 +223,17 @@ func (a actionKind) consequence() string {
 	}
 }
 
-// destructive reports whether the action removes/moves work and therefore
-// needs a confirm prompt (pop and drop) versus running immediately (apply).
-func (a actionKind) destructive() bool { return a == actionPop || a == actionDrop }
+// needsConfirm reports whether the action opens a y/N confirm prompt before
+// running (pop and drop). Apply runs immediately; branch instead gates on the
+// inline branch-name editor, so neither needs the y/N prompt.
+func (a actionKind) needsConfirm() bool { return a == actionPop || a == actionDrop }
+
+// removesStash reports whether a successful action removes the stash from the
+// stack and therefore requires a post-op reload + sidecar prune (pop, drop, and
+// branch — which applies-then-drops). Apply leaves the stack unchanged.
+func (a actionKind) removesStash() bool {
+	return a == actionPop || a == actionDrop || a == actionBranch
+}
 
 // actionDoneMsg carries the result of a mutating git op plus the context
 // needed to update the view: which stash (by SHA, since the index it had may
@@ -253,6 +279,13 @@ type Model struct {
 	editing bool            // true while the inline label editor is open
 	input   textinput.Model // the label text field (valid while editing)
 	notice  string          // transient status line (e.g. "saved"/error)
+
+	// --- issue #9: stash -> branch ---
+	// branching is true while the inline branch-name editor is open. It shares
+	// the `input` field with the label editor but commits to a different action
+	// (`git stash branch`) rather than a sidecar relabel, so the two modes are
+	// tracked separately and are mutually exclusive.
+	branching bool
 
 	// --- M5 actions ---
 	actions    Actions    // mutating ops (apply/pop/drop) + reload; zero disables
@@ -346,12 +379,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // handleKey processes key presses: navigation, scrolling, labeling, actions,
-// and quit. While the inline label editor or a confirm prompt is open, keys are
-// routed there instead; while a mutation is in flight the UI is input-locked
-// except for quit.
+// and quit. While the inline label/branch editor or a confirm prompt is open,
+// keys are routed there instead; while a mutation is in flight the UI is
+// input-locked except for quit.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.editing {
 		return m.handleEditKey(msg)
+	}
+	if m.branching {
+		return m.handleBranchKey(msg)
 	}
 	if m.confirming {
 		return m.handleConfirmKey(msg)
@@ -380,6 +416,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "l":
 		return m.beginEdit()
+	case "b":
+		return m.beginBranch()
 
 	case "a":
 		return m.startAction(actionApply)
@@ -469,6 +507,70 @@ func (m Model) commitEdit() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// beginBranch opens the inline branch-name editor for the selected stash,
+// seeding it with a slugified suggestion derived from the stash's label
+// (issue #9). Committing it runs `git stash branch`. It is a no-op (with a
+// toast) when the branch action is unavailable (no injected func) or there is
+// no selection. Unlike labeling it does not require a sidecar store — promoting
+// a stash to a branch is a pure git operation.
+func (m Model) beginBranch() (tea.Model, tea.Cmd) {
+	if len(m.stashes) == 0 {
+		return m, nil
+	}
+	if m.actions.Branch == nil {
+		m.notice = "branch: unavailable"
+		return m, nil
+	}
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.CharLimit = 120
+	ti.SetValue(m.stashes[m.cursor].BranchSuggestion())
+	ti.CursorEnd()
+	ti.Width = m.listInnerW
+	if ti.Width < 8 {
+		ti.Width = 8
+	}
+	ti.Focus()
+	m.input = ti
+	m.branching = true
+	m.notice = ""
+	return m, textinput.Blink
+}
+
+// handleBranchKey drives the inline branch-name editor: Enter commits (creates
+// the branch), Esc cancels, everything else edits the text field.
+func (m Model) handleBranchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		return m.commitBranch()
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.branching = false
+		m.notice = "branch cancelled"
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+// commitBranch closes the branch-name editor and fires `git stash branch` with
+// the entered name against the selected stash. An empty name is rejected with a
+// toast (git would otherwise misparse the ref as the branch name) and the
+// editor simply closes so the user can retry. On success the stash is applied
+// to the new branch and removed, so the result is handled like a pop/drop.
+func (m Model) commitBranch() (tea.Model, tea.Cmd) {
+	m.branching = false
+	if len(m.stashes) == 0 || m.actions.Branch == nil {
+		return m, nil
+	}
+	name := strings.TrimSpace(m.input.Value())
+	if name == "" {
+		m.notice = "branch name required"
+		return m, nil
+	}
+	return m.fireBranch(name)
+}
+
 // moveCursor moves the selection by delta and (if it changed) loads the new
 // stash's diff.
 func (m Model) moveCursor(delta int) (tea.Model, tea.Cmd) {
@@ -478,8 +580,9 @@ func (m Model) moveCursor(delta int) (tea.Model, tea.Cmd) {
 
 // startAction begins a mutating action on the selected stash. Apply runs
 // immediately (non-destructive); pop and drop open a y/n confirm prompt first.
-// It is a no-op (with an explanatory toast) when the action is unavailable
-// (no injected func) or there is no selection.
+// (Branch is not routed here — it has its own inline name editor.) It is a
+// no-op (with an explanatory toast) when the action is unavailable (no injected
+// func) or there is no selection.
 func (m Model) startAction(kind actionKind) (tea.Model, tea.Cmd) {
 	if len(m.stashes) == 0 {
 		return m, nil
@@ -489,7 +592,7 @@ func (m Model) startAction(kind actionKind) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.notice = ""
-	if kind.destructive() {
+	if kind.needsConfirm() {
 		m.confirming = true
 		m.pending = kind
 		return m, nil
@@ -539,6 +642,44 @@ func (m Model) fireAction(kind actionKind) (tea.Model, tea.Cmd) {
 	return m, m.runActionCmd(kind, s.Ref(), s.SHA)
 }
 
+// fireBranch locks the UI and dispatches the async `git stash branch` op,
+// creating branch name from the selected stash. Like fireAction it captures the
+// ref/SHA so the post-op handler can prune + resync even as indices shift; the
+// branch name travels in the closure. A successful branch removes the stash, so
+// the result is handled exactly like a pop/drop (reload + prune).
+func (m Model) fireBranch(name string) (tea.Model, tea.Cmd) {
+	if len(m.stashes) == 0 {
+		return m, nil
+	}
+	s := m.stashes[m.cursor]
+	m.busy = true
+	m.notice = "Branching " + s.Ref() + " → " + name + "…"
+	return m, m.runBranchCmd(name, s.Ref(), s.SHA)
+}
+
+// runBranchCmd returns a command that runs `git stash branch <name> <ref>` and,
+// on success, reloads the stash list (branch applies-then-drops, so the stack
+// shrank). It mirrors runActionCmd but binds the branch name and uses the
+// injected BranchFunc.
+func (m Model) runBranchCmd(name, ref, sha string) tea.Cmd {
+	fn := m.actions.Branch
+	reload := m.actions.Reload
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := fn(ctx, name, ref); err != nil {
+			return actionDoneMsg{kind: actionBranch, sha: sha, ref: ref, err: err}
+		}
+		res := actionDoneMsg{kind: actionBranch, sha: sha, ref: ref, didMutate: true}
+		if reload != nil {
+			stashes, rerr := reload(ctx)
+			res.reloaded = stashes
+			res.reloadErr = rerr
+		}
+		return res
+	}
+}
+
 // gerund returns the "-ing" form of an action for the in-flight toast.
 func (m Model) gerund(kind actionKind) string {
 	switch kind {
@@ -548,14 +689,16 @@ func (m Model) gerund(kind actionKind) string {
 		return "popping"
 	case actionDrop:
 		return "dropping"
+	case actionBranch:
+		return "branching"
 	default:
 		return "working"
 	}
 }
 
 // runActionCmd returns a command that performs the mutating git op and, on
-// success for a pop/drop, reloads the stash list so indices resync. Apply does
-// not change the stash set, so it skips the reload.
+// success for a pop/drop/branch, reloads the stash list so indices resync.
+// Apply does not change the stash set, so it skips the reload.
 func (m Model) runActionCmd(kind actionKind, ref, sha string) tea.Cmd {
 	fn := m.actionFunc(kind)
 	reload := m.actions.Reload
@@ -566,8 +709,8 @@ func (m Model) runActionCmd(kind actionKind, ref, sha string) tea.Cmd {
 			return actionDoneMsg{kind: kind, sha: sha, ref: ref, err: err}
 		}
 		res := actionDoneMsg{kind: kind, sha: sha, ref: ref, didMutate: true}
-		// Apply leaves the stack unchanged; only pop/drop need a resync.
-		if kind.destructive() && reload != nil {
+		// Apply leaves the stack unchanged; pop/drop/branch need a resync.
+		if kind.removesStash() && reload != nil {
 			stashes, rerr := reload(ctx)
 			res.reloaded = stashes
 			res.reloadErr = rerr
@@ -577,8 +720,8 @@ func (m Model) runActionCmd(kind actionKind, ref, sha string) tea.Cmd {
 }
 
 // handleActionDone applies the result of a mutating op: it sets the toast,
-// and for a successful pop/drop swaps in the reloaded stash list, prunes the
-// sidecar entry for the removed stash, clamps the cursor, and reloads the
+// and for a successful pop/drop/branch swaps in the reloaded stash list, prunes
+// the sidecar entry for the removed stash, clamps the cursor, and reloads the
 // preview for the newly-selected stash.
 func (m Model) handleActionDone(msg actionDoneMsg) (tea.Model, tea.Cmd) {
 	m.busy = false
@@ -589,13 +732,13 @@ func (m Model) handleActionDone(msg actionDoneMsg) (tea.Model, tea.Cmd) {
 	}
 
 	// Apply succeeded: the stack is unchanged, just confirm via toast.
-	if !msg.kind.destructive() {
+	if !msg.kind.removesStash() {
 		m.notice = msg.ref + " " + msg.kind.verb()
 		return m, nil
 	}
 
-	// Pop/drop succeeded. Prune the sidecar entry for the removed stash so its
-	// label doesn't linger, then resync the list from the reload.
+	// Pop/drop/branch succeeded. Prune the sidecar entry for the removed stash
+	// so its label doesn't linger, then resync the list from the reload.
 	if p, ok := m.store.(pruner); ok && msg.sha != "" {
 		live := map[string]struct{}{}
 		for _, s := range msg.reloaded {
@@ -743,6 +886,14 @@ func (m Model) footer() string {
 		return editPromptStyle.Render(label+": ") + m.input.View() +
 			helpStyle.Render("  ⏎ save · esc cancel")
 	}
+	if m.branching {
+		label := "branch"
+		if m.cursor >= 0 && m.cursor < len(m.stashes) {
+			label = "branch " + m.stashes[m.cursor].Ref() + " →"
+		}
+		return editPromptStyle.Render(label+": ") + m.input.View() +
+			helpStyle.Render("  ⏎ create · esc cancel")
+	}
 	if m.confirming {
 		ref := ""
 		if m.cursor >= 0 && m.cursor < len(m.stashes) {
@@ -754,7 +905,7 @@ func (m Model) footer() string {
 	if m.notice != "" {
 		return helpStyle.Render(m.notice)
 	}
-	return helpStyle.Render("↑/↓ select · l label · a apply · p pop · d drop · ⏎/space scroll · q quit")
+	return helpStyle.Render("↑/↓ select · l label · b branch · a apply · p pop · d drop · ⏎/space scroll · q quit")
 }
 
 // renderList draws the stash rows, highlighting the cursor row.

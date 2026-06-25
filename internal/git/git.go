@@ -6,7 +6,8 @@
 // plus EnrichDiffstats(). M5 adds the mutating operations Apply, Pop, Drop, and
 // Push — each kept thin (shell out, parse, surface git's own errors) and, for
 // the TUI's sake, returning enough information (e.g. the new stash SHA on Push)
-// to keep the sidecar metadata coherent.
+// to keep the sidecar metadata coherent. Issue #9 adds Branch (promote a stash
+// to a real branch via `git stash branch`).
 package git
 
 import (
@@ -282,6 +283,36 @@ func Pop(ctx context.Context, ref string) error {
 func Drop(ctx context.Context, ref string) error {
 	return runMutation(ctx, fmt.Sprintf("git stash drop %s", ref), "stash", "drop", ref)
 }
+
+// Branch promotes a stash to a new branch via `git stash branch <name> <ref>`
+// (issue #9). git creates the branch off the commit the stash was based on,
+// checks it out, applies the stash there, and — on a clean apply — drops the
+// stash from the stack. This is the cleanest way to revive a stash that has
+// drifted from its origin: applying on the original base avoids the spurious
+// conflicts you'd get applying onto an unrelated HEAD.
+//
+// Because a successful branch removes the stash entry, callers should treat it
+// like Pop for sidecar bookkeeping (prune the entry, reload the list). If the
+// apply conflicts, git leaves the stash in place and exits non-zero; we surface
+// that error verbatim so the caller can warn and the entry is preserved.
+//
+// It returns ErrNotARepo outside a work tree, ErrEmptyBranchName when name is
+// blank (git would otherwise misparse the ref as the branch name), and
+// surfaces git's own error text otherwise — most importantly a
+// "branch already exists" or merge-conflict message.
+func Branch(ctx context.Context, name, ref string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ErrEmptyBranchName
+	}
+	return runMutation(ctx, fmt.Sprintf("git stash branch %s %s", name, ref), "stash", "branch", name, ref)
+}
+
+// ErrEmptyBranchName is returned by Branch when given a blank branch name. It
+// is an expected, friendly validation error (not a git failure): without a
+// name git would treat the stash ref as the branch name, creating a confusing
+// branch and a worse error.
+var ErrEmptyBranchName = errors.New("branch name must not be empty")
 
 // Push stashes the current working-tree changes via `git stash push -m <msg>`
 // and returns the content SHA of the newly-created stash (always stash@{0}

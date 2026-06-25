@@ -20,6 +20,9 @@
 // computed on the fly for display only, and callers visually distinguish them
 // from real, user-chosen labels (e.g. dim/italic) so the user can tell a guess
 // from a name they typed.
+//
+// Slug (issue #9) is a sibling helper: it turns a human label into a valid,
+// readable git branch name suggestion for the "stash → branch" flow.
 package autolabel
 
 import (
@@ -174,4 +177,94 @@ func splitNonEmpty(s, sep string) []string {
 		}
 	}
 	return out
+}
+
+// Slug turns a human label (or any free text) into a safe, readable git branch
+// name suggestion for the "stash → branch" flow (issue #9). It lower-cases the
+// input, replaces any run of characters that are unsafe or awkward in a branch
+// name with a single hyphen, and trims stray separators, yielding names like:
+//
+//	"payments: fix retry"   -> "payments-fix-retry"
+//	"WIP on main: a1b2c3d"  -> "wip-on-main-a1b2c3d"
+//	"feature/login flow"    -> "feature/login-flow"  (slashes are kept)
+//	"  spaced  out  "        -> "spaced-out"
+//
+// Branch names have real constraints (git check-ref-format): no spaces, no
+// "..", no ~ ^ : ? * [ \, no control chars, no leading/trailing or doubled
+// "/", no trailing ".lock", and they can't be a single "@". Slug enforces all
+// of these so the suggestion is always something `git branch` will accept.
+// A label that slugs to nothing (e.g. only punctuation) yields "", letting
+// callers fall back to a generic default.
+func Slug(label string) string {
+	s := strings.ToLower(strings.TrimSpace(label))
+	if s == "" {
+		return ""
+	}
+
+	// Map each rune to either itself (kept) or a hyphen (separator). We keep
+	// ASCII alphanumerics, '/', '.', '_', and '-'; everything else (spaces,
+	// ':', git-forbidden metacharacters, control bytes, non-ASCII) becomes a
+	// hyphen so words stay split but the result is pure-safe.
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '/' || r == '.' || r == '_' || r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := b.String()
+
+	// Collapse separator runs and fix git-illegal sequences. Order matters:
+	// resolve ".." before trimming so "a..b" -> "a-b".
+	out = collapseRuns(out, '-')
+	out = strings.ReplaceAll(out, "..", "-") // ".." is forbidden anywhere
+	out = collapseRuns(out, '/')             // no doubled slashes
+
+	// Trim separators from each path segment and drop empty ones, so a stray
+	// leading/trailing '/' or '-' (or '.') can't produce an illegal ref.
+	segs := strings.Split(out, "/")
+	kept := segs[:0]
+	for _, seg := range segs {
+		seg = strings.Trim(seg, "-._")
+		seg = strings.TrimSuffix(seg, ".lock") // a path component can't end in .lock
+		seg = strings.Trim(seg, "-._")
+		if seg != "" {
+			kept = append(kept, seg)
+		}
+	}
+	res := strings.Join(kept, "/")
+
+	// "@" alone is reserved by git; our mapping never emits '@', but guard the
+	// degenerate empty result explicitly.
+	if res == "@" {
+		return ""
+	}
+	return res
+}
+
+// collapseRuns replaces any run of two or more c with a single c.
+func collapseRuns(s string, c byte) string {
+	if s == "" {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	prev := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			if prev {
+				continue
+			}
+			prev = true
+		} else {
+			prev = false
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }

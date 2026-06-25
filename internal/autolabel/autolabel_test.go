@@ -1,6 +1,9 @@
 package autolabel
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestArea(t *testing.T) {
 	cases := []struct {
@@ -99,5 +102,70 @@ func TestDeriveNoDanglingSeparator(t *testing.T) {
 	}
 	if got := Derive("", "x.go"); got != "x" {
 		t.Errorf("Derive with empty branch = %q, want %q", got, "x")
+	}
+}
+
+func TestSlug(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"whitespace", "   ", ""},
+		{"simple label", "payments: fix retry", "payments-fix-retry"},
+		{"git subject", "WIP on main: a1b2c3d", "wip-on-main-a1b2c3d"},
+		{"keeps slashes", "feature/login flow", "feature/login-flow"},
+		{"collapses spaces", "  spaced   out  ", "spaced-out"},
+		{"lowercases", "Payments Retry", "payments-retry"},
+		{"strips punctuation runs", "fix!!! the?? bug", "fix-the-bug"},
+		{"trims separators", "--edge--", "edge"},
+		{"double dots forbidden", "a..b", "a-b"},
+		{"no doubled slashes", "a//b", "a/b"},
+		{"trailing slash dropped", "feature/", "feature"},
+		{"leading slash dropped", "/feature", "feature"},
+		{"dot-lock suffix stripped", "release.lock", "release"},
+		{"only punctuation is empty", "!@#$%", ""},
+		{"underscores survive", "snake_case_name", "snake_case_name"},
+		{"unicode becomes hyphen", "café résumé", "caf-r-sum"},
+	}
+	for _, c := range cases {
+		if got := Slug(c.in); got != c.want {
+			t.Errorf("%s: Slug(%q) = %q, want %q", c.name, c.in, got, c.want)
+		}
+	}
+}
+
+// Slug output must always be a name `git check-ref-format` would accept: no
+// spaces, no forbidden metacharacters, no ".." or doubled/edge slashes.
+func TestSlugProducesSafeRefs(t *testing.T) {
+	inputs := []string{
+		"payments: fix retry",
+		"WIP on main: a1b2c3d Tidy things",
+		"feature/PROJ-123: add cache layer~v2",
+		"weird:?*[chars]\\here",
+		"...dots...and---dashes...",
+	}
+	const forbidden = " ~^:?*[\\"
+	for _, in := range inputs {
+		got := Slug(in)
+		if got == "" {
+			continue // empty is a valid "no suggestion" signal
+		}
+		if strings.ContainsAny(got, forbidden) {
+			t.Errorf("Slug(%q) = %q contains a git-forbidden character", in, got)
+		}
+		if strings.Contains(got, "..") {
+			t.Errorf("Slug(%q) = %q contains '..'", in, got)
+		}
+		if strings.Contains(got, "//") {
+			t.Errorf("Slug(%q) = %q contains '//'", in, got)
+		}
+		if strings.HasPrefix(got, "/") || strings.HasSuffix(got, "/") {
+			t.Errorf("Slug(%q) = %q has an edge slash", in, got)
+		}
+		if strings.HasSuffix(got, ".lock") {
+			t.Errorf("Slug(%q) = %q ends in .lock", in, got)
+		}
 	}
 }
