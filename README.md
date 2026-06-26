@@ -32,7 +32,9 @@ interactive TUI with diff preview, sidecar labels, apply/pop/drop, a labeled
 [milestones](https://github.com/rwrife/stash-stash/issues?q=label%3Amilestone).
 
 **Beyond v0.1:** auto-labels (`<area>: <hint>` from the branch + top changed
-file) and **`stash-stash search`** — grep across every stash's contents at once.
+file), **`stash-stash search`** — grep across every stash's contents at once —
+and **`stash-stash doctor`** — recover stashes you thought you lost (reflog +
+`git fsck`) and clean up orphaned labels.
 
 ## Install
 
@@ -79,6 +81,8 @@ stash-stash | cat            # piped/non-TTY → plain table automatically
 stash-stash push -m "label"  # stash with a label that actually sticks
 stash-stash search retry     # grep every stash's contents at once
 stash-stash search --regex 'retry.*=.*[0-9]'  # regex search (case-insensitive)
+stash-stash doctor           # find & restore lost stashes; clean orphaned labels
+stash-stash doctor --dry-run # just report what's recoverable (no prompts)
 stash-stash --stale-days 7   # flag anything older than a week as dusty
 stash-stash --stale-days 0   # disable the staleness nag entirely
 stash-stash --json | jq .    # machine-readable list for scripting
@@ -192,6 +196,40 @@ looks for `retry budget`). Diff metadata (headers, `index`, mode lines) is never
 matched — only real content. Exit status is `0` when the search runs (even with
 no matches, which prints a friendly note), `2` for a missing term or an
 un-compilable `--regex` pattern, and `1` if git can't be reached.
+
+### Recovering lost work (`doctor`)
+
+Dropped the wrong stash? Lost one to a hard reset or an aborted rebase? A stash
+commit doesn't vanish the instant it leaves `git stash list` — it lingers in the
+object database until git eventually garbage-collects it. `stash-stash doctor`
+finds those and helps you get them back.
+
+```bash
+stash-stash doctor            # interactive: restore / diff / skip each finding
+stash-stash doctor --dry-run  # report only — no prompts, nothing changes
+```
+
+What it does:
+
+- **Finds recoverable stashes** by scanning the stash reflog *and*
+  `git fsck --unreachable` for stash-shaped commits (`WIP on …` / `On …`) that
+  are no longer on the stack. The two sources complement each other: the reflog
+  catches recently-dropped stashes (with their original subject), while `fsck`
+  catches ones orphaned by a reset/rebase or whose reflog entry has expired.
+- **Restores** a chosen one with `git stash store`, so it reappears as
+  `stash@{0}` in `git stash list`. This only *adds* a ref — it never applies the
+  stash to your working tree and never drops anything.
+- **Shows the diff** (`[d]`) before you decide, so you can confirm it's the work
+  you want back.
+- **Reports orphaned sidecar labels** — entries in `.git/stash-stash.json` whose
+  stash is gone for good (not on the stack and not recoverable) — and offers to
+  delete them. A label for still-recoverable work is never flagged.
+
+It's safe by default: in a pipe/non-TTY or with `--dry-run` it prints a
+read-only report and changes nothing; restoring or deleting only happens behind
+an explicit keypress in an interactive terminal. Exit status is `0` on a clean
+bill of health or a completed triage, `2` on bad flags, and `1` on a git/sidecar
+failure.
 
 ## Auto-labels
 

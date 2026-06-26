@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -362,5 +363,320 @@ func TestSearchMultiWordTerm(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "retry budget grew") {
 		t.Errorf("multi-word term search missed the line:\n%s", stdout.String())
+	}
+}
+
+// --- issue #10: doctor subcommand ----------------------------------------
+
+// stubDangling swaps the indirected gitDangling to return a fixed set.
+func stubDangling(t *testing.T, ds []git.DanglingStash, err error) {
+	t.Helper()
+	orig := gitDangling
+	gitDangling = func(ctx context.Context) ([]git.DanglingStash, error) {
+		return ds, err
+	}
+	t.Cleanup(func() { gitDangling = orig })
+}
+
+// stubStoreStash swaps the indirected gitStoreStash, recording each restore.
+func stubStoreStash(t *testing.T, err error) *[]string {
+	t.Helper()
+	var restored []string
+	orig := gitStoreStash
+	gitStoreStash = func(ctx context.Context, sha, message string) error {
+		restored = append(restored, sha)
+		return err
+	}
+	t.Cleanup(func() { gitStoreStash = orig })
+	return &restored
+}
+
+// forceNonTTYStdin pins stdinIsTTY to false so runDoctor takes the read-only
+// report path deterministically in tests (no real terminal involved).
+func forceNonTTYStdin(t *testing.T) {
+	t.Helper()
+	orig := stdinIsTTY
+	stdinIsTTY = func() bool { return false }
+	t.Cleanup(func() { stdinIsTTY = orig })
+}
+
+func TestDoctorCleanBillOfHealth(t *testing.T) {
+	stubDangling(t, nil, nil)
+	stubList(t, nil, nil)
+	tempRepoSidecar(t) // empty sidecar -> no orphans
+	forceNonTTYStdin(t)
+
+	var stdout, stderr bytes.Buffer
+	code := runDoctor(nil, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Clean bill of health") {
+		t.Errorf("stdout = %q, want a clean-bill message", stdout.String())
+	}
+}
+
+func TestDoctorNotARepo(t *testing.T) {
+	stubDangling(t, nil, git.ErrNotARepo)
+
+	var stdout, stderr bytes.Buffer
+	code := runDoctor(nil, strings.NewReader(""), &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 outside a repo", code)
+	}
+	if !strings.Contains(stderr.String(), "not a git repository") {
+		t.Errorf("stderr = %q, want a not-a-repo message", stderr.String())
+	}
+}
+
+func TestDoctorDryRunReportsButDoesNotChange(t *testing.T) {
+	stubDangling(t, []git.DanglingStash{
+		{SHA: "deadbeefcafe00", Subject: "WIP on main: lost work", Branch: "main", Source: "reflog"},
+	}, nil)
+	stubList(t, nil, nil)
+	restored := stubStoreStash(t, nil)
+	dir := tempRepoSidecar(t)
+	// Seed an orphaned label so the report shows it too.
+	seedSidecar(t, dir, map[string]string{"00orphansha00": "label for gone work"})
+
+	var stdout, stderr bytes.Buffer
+	code := runDoctor([]string{"--dry-run"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Recoverable stashes") || !strings.Contains(out, "deadbeefcafe") {
+		t.Errorf("stdout = %q, want the recoverable stash listed", out)
+	}
+	if !strings.Contains(out, "Orphaned sidecar labels") || !strings.Contains(out, "label for gone work") {
+		t.Errorf("stdout = %q, want the orphaned label listed", out)
+	}
+	if !strings.Contains(out, "Dry run") {
+		t.Errorf("stdout = %q, want a dry-run notice", out)
+	}
+	if len(*restored) != 0 {
+		t.Errorf("dry run restored stashes: %v", *restored)
+	}
+	// The sidecar must be untouched (orphan still present).
+	if s := readSidecar(t, dir); !strings.Contains(s, "label for gone work") {
+		t.Errorf("dry run modified the sidecar: %q", s)
+	}
+}
+
+func TestDoctorNonTTYIsReadOnly(t *testing.T) {
+	// Non-TTY stdin (the default in tests) must not prompt or change anything,
+	// even without --dry-run.
+	stubDangling(t, []git.DanglingStash{
+		{SHA: "abc123abc123", Subject: "WIP on main: x", Branch: "main", Source: "fsck"},
+	}, nil)
+	stubList(t, nil, nil)
+	restored := stubStoreStash(t, nil)
+	tempRepoSidecar(t)
+	forceNonTTYStdin(t)
+
+	var stdout, stderr bytes.Buffer
+	code := runDoctor(nil, strings.NewReader("r\n"), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if len(*restored) != 0 {
+		t.Errorf("non-TTY run restored stashes despite no prompt: %v", *restored)
+	}
+	if !strings.Contains(stdout.String(), "interactive terminal") {
+		t.Errorf("stdout = %q, want a hint to run interactively", stdout.String())
+	}
+}
+
+func TestDoctorUnexpectedArg(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := runDoctor([]string{"stray"}, strings.NewReader(""), &stdout, &stderr)
+	if code != 2 {
+		t.Fatalf("exit = %d, want 2 for a stray arg", code)
+	}
+}
+
+// --- doctorTriage: the interactive engine, driven by scripted input ------
+
+func TestDoctorTriageRestoresOnR(t *testing.T) {
+	restored := stubStoreStash(t, nil)
+	store := newTempStore(t)
+	dangling := []git.DanglingStash{
+		{SHA: "deadbeefcafe11", Subject: "WIP on main: rescue me", Branch: "main", Source: "reflog"},
+	}
+
+	var stdout, stderr bytes.Buffer
+	in := bufio.NewReader(strings.NewReader("r\n"))
+	code := doctorTriage(context.Background(), in, &stdout, &stderr, store, dangling, nil)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if len(*restored) != 1 || (*restored)[0] != "deadbeefcafe11" {
+		t.Fatalf("restored = %v, want the one SHA", *restored)
+	}
+	if !strings.Contains(stdout.String(), "restored as stash@{0}") {
+		t.Errorf("stdout = %q, want a restore confirmation", stdout.String())
+	}
+}
+
+func TestDoctorTriageDiffThenRestore(t *testing.T) {
+	restored := stubStoreStash(t, nil)
+	// gitShow backs the [d]iff action; return a small patch for the SHA.
+	stubShow(t, map[string]string{
+		"deadbeefcafe22": "--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-old\n+new\n",
+	}, nil)
+	store := newTempStore(t)
+	dangling := []git.DanglingStash{
+		{SHA: "deadbeefcafe22", Subject: "WIP on main: peek then rescue", Source: "fsck"},
+	}
+
+	var stdout, stderr bytes.Buffer
+	// First show the diff, then restore.
+	in := bufio.NewReader(strings.NewReader("d\nr\n"))
+	code := doctorTriage(context.Background(), in, &stdout, &stderr, store, dangling, nil)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "+new") {
+		t.Errorf("stdout = %q, want the diff shown after [d]", out)
+	}
+	if len(*restored) != 1 {
+		t.Errorf("restored = %v, want exactly one after d then r", *restored)
+	}
+}
+
+func TestDoctorTriageSkipLeavesEverything(t *testing.T) {
+	restored := stubStoreStash(t, nil)
+	store := newTempStore(t)
+	store.SetLabel("orphan1", "keep on skip")
+	dangling := []git.DanglingStash{{SHA: "sha1", Subject: "WIP on main: x", Source: "reflog"}}
+	orphans := store.Orphans(map[string]struct{}{}) // orphan1 is unknown
+
+	var stdout, stderr bytes.Buffer
+	// Skip the dangling stash, then skip the orphan.
+	in := bufio.NewReader(strings.NewReader("s\ns\n"))
+	code := doctorTriage(context.Background(), in, &stdout, &stderr, store, dangling, orphans)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if len(*restored) != 0 {
+		t.Errorf("skip restored a stash: %v", *restored)
+	}
+	if _, ok := store.Label("orphan1"); !ok {
+		t.Error("skip removed the orphaned label")
+	}
+}
+
+func TestDoctorTriageDeletesOrphanAndSaves(t *testing.T) {
+	stubStoreStash(t, nil)
+	dir := tempRepoSidecar(t)
+	store := loadSidecarStore(t)
+	store.SetLabel("orphanX", "delete me")
+	if err := store.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+	orphans := store.Orphans(map[string]struct{}{})
+
+	var stdout, stderr bytes.Buffer
+	in := bufio.NewReader(strings.NewReader("d\n"))
+	code := doctorTriage(context.Background(), in, &stdout, &stderr, store, nil, orphans)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	if _, ok := store.Label("orphanX"); ok {
+		t.Error("orphan label still present in memory after delete")
+	}
+	// Persisted: the saved sidecar must no longer mention the label.
+	if s := readSidecar(t, dir); strings.Contains(s, "delete me") {
+		t.Errorf("sidecar still contains the deleted label: %q", s)
+	}
+}
+
+func TestDoctorTriageQuitStopsEarly(t *testing.T) {
+	restored := stubStoreStash(t, nil)
+	store := newTempStore(t)
+	dangling := []git.DanglingStash{
+		{SHA: "first0", Subject: "WIP on main: first", Source: "reflog"},
+		{SHA: "second", Subject: "WIP on main: second", Source: "reflog"},
+	}
+
+	var stdout, stderr bytes.Buffer
+	// Quit immediately at the first prompt — neither should be restored.
+	in := bufio.NewReader(strings.NewReader("q\n"))
+	code := doctorTriage(context.Background(), in, &stdout, &stderr, store, dangling, nil)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if len(*restored) != 0 {
+		t.Errorf("quit still restored: %v", *restored)
+	}
+}
+
+func TestDoctorTriageRestoreErrorIsReported(t *testing.T) {
+	restored := stubStoreStash(t, errors.New("boom: bad object"))
+	store := newTempStore(t)
+	dangling := []git.DanglingStash{{SHA: "sha1", Subject: "WIP on main: x", Source: "reflog"}}
+
+	var stdout, stderr bytes.Buffer
+	in := bufio.NewReader(strings.NewReader("r\n"))
+	code := doctorTriage(context.Background(), in, &stdout, &stderr, store, dangling, nil)
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (a per-item restore error is non-fatal)", code)
+	}
+	// StoreStash was attempted, and the error surfaced on stderr.
+	if len(*restored) != 1 {
+		t.Errorf("restore not attempted: %v", *restored)
+	}
+	if !strings.Contains(stderr.String(), "could not restore") {
+		t.Errorf("stderr = %q, want a restore-failure note", stderr.String())
+	}
+}
+
+// --- small helpers for the doctor tests ----------------------------------
+
+// newTempStore returns a *meta.Store bound to a fresh temp git repo so Save
+// works, without seeding any entries. Tests add labels as needed.
+func newTempStore(t *testing.T) *meta.Store {
+	t.Helper()
+	dir := t.TempDir()
+	cmd := exec.Command("git", "init", "-q", dir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	prev, _ := os.Getwd()
+	_ = os.Chdir(dir)
+	defer os.Chdir(prev)
+	s, err := meta.Load(context.Background())
+	if err != nil {
+		t.Fatalf("meta.Load: %v", err)
+	}
+	return s
+}
+
+// loadSidecarStore loads the store for the temp repo most recently bound by
+// tempRepoSidecar (via the indirected metaLoad), so a test can seed entries
+// through the same path runDoctor will read.
+func loadSidecarStore(t *testing.T) *meta.Store {
+	t.Helper()
+	s, err := metaLoad(context.Background())
+	if err != nil {
+		t.Fatalf("metaLoad: %v", err)
+	}
+	return s
+}
+
+// seedSidecar writes the given sha->label entries into the temp repo's sidecar
+// via the indirected metaLoad path, so runDoctor sees them as orphans.
+func seedSidecar(t *testing.T, dir string, labels map[string]string) {
+	t.Helper()
+	s, err := metaLoad(context.Background())
+	if err != nil {
+		t.Fatalf("seed metaLoad: %v", err)
+	}
+	for sha, label := range labels {
+		s.SetLabel(sha, label)
+	}
+	if err := s.Save(); err != nil {
+		t.Fatalf("seed save: %v", err)
 	}
 }

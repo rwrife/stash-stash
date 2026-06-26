@@ -11,6 +11,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -46,6 +47,15 @@ var stdoutIsTTY = func() bool {
 	return term.IsTerminal(int(os.Stdout.Fd()))
 }
 
+// stdinIsTTY reports whether standard input is an interactive terminal. The
+// doctor command uses it to decide whether it can safely prompt for
+// restore/delete choices; when stdin is a pipe or redirected file it falls back
+// to a read-only report instead. It is a package var so tests can force either
+// path without a real TTY.
+var stdinIsTTY = func() bool {
+	return term.IsTerminal(int(os.Stdin.Fd()))
+}
+
 // noTUI lets `--no-tui` (or a non-TTY stdout) force the plain table even in an
 // interactive shell, which is handy for screenshots, logs, and scripting.
 var noTUIFlag bool
@@ -63,6 +73,11 @@ var (
 	metaLoad = meta.Load
 	gitList  = git.List
 	gitShow  = git.Show
+
+	// Doctor (issue #10) indirections, so runDoctor can be unit-tested without a
+	// real repo, dangling commits, or sidecar file.
+	gitDangling   = git.DanglingStashes
+	gitStoreStash = git.StoreStash
 )
 
 func main() {
@@ -82,12 +97,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "search" {
 		return runSearch(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "doctor" {
+		return runDoctor(args[1:], os.Stdin, stdout, stderr)
+	}
 
 	fs := flag.NewFlagSet("stash-stash", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "stash-stash %s — a concierge for your git stash graveyard.\n\n", version)
-		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n\nFlags:\n")
+		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n  stash-stash doctor [--dry-run]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	showVersion := fs.Bool("version", false, "print version and exit")
@@ -409,4 +427,303 @@ func runSearch(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// runDoctor implements `stash-stash doctor`: find work you thought you lost
+// (issue #10). It scans the reflog and `git fsck` for stash-like commits that
+// have fallen off `git stash list` but are still recoverable, and reports
+// sidecar entries whose stash is gone for good (orphaned metadata).
+//
+// Interactivity: when stdin is a TTY and --dry-run is not set, it walks each
+// finding and prompts — restore/diff/skip for a dangling stash, delete/skip for
+// an orphaned label. Restoring re-attaches the commit to the stack with
+// `git stash store` (non-destructive: it only adds a ref). Without a TTY (pipe,
+// CI) or with --dry-run, it prints the same report read-only and changes
+// nothing, so it stays script-safe.
+//
+// It returns the process exit code: 0 on a clean bill of health or a completed
+// triage, 2 on bad flags, and 1 on a git/sidecar failure.
+func runDoctor(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("stash-stash doctor", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fmt.Fprintf(stderr, "stash-stash doctor \u2014 recover work you thought you lost.\n\n")
+		fmt.Fprintf(stderr, "Scans the reflog and git fsck for dangling stash commits no longer in\n")
+		fmt.Fprintf(stderr, "`git stash list`, offers to restore them, and reports orphaned sidecar\n")
+		fmt.Fprintf(stderr, "labels whose stash is gone.\n\n")
+		fmt.Fprintf(stderr, "Usage:\n  stash-stash doctor [--dry-run]\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	dryRun := fs.Bool("dry-run", false, "report findings without prompting or changing anything")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(stderr, "stash-stash doctor: unexpected argument %q.\n", fs.Arg(0))
+		return 2
+	}
+
+	ctx := context.Background()
+
+	// 1. Recoverable dangling stashes (reflog + fsck), excluding live ones.
+	dangling, err := gitDangling(ctx)
+	if err != nil {
+		if errors.Is(err, git.ErrNotARepo) {
+			fmt.Fprintln(stderr, "stash-stash: not a git repository (run me inside one).")
+			return 1
+		}
+		fmt.Fprintf(stderr, "stash-stash: %v\n", err)
+		return 1
+	}
+
+	// 2. Orphaned sidecar metadata: labels whose SHA is neither a live stash nor
+	// a recoverable dangling one. Best-effort — a sidecar problem must not stop
+	// the recovery report, so we note it and continue with no orphans.
+	var orphans []meta.Orphan
+	store, lerr := metaLoad(ctx)
+	if lerr != nil {
+		fmt.Fprintf(stderr, "stash-stash: sidecar metadata unavailable (%v); skipping orphan check.\n", lerr)
+	} else {
+		known := knownSHAs(ctx, dangling)
+		orphans = store.Orphans(known)
+	}
+
+	// Nothing wrong? Say so and leave.
+	if len(dangling) == 0 && len(orphans) == 0 {
+		fmt.Fprintln(stdout, "\U0001FA7A Clean bill of health: no lost stashes and no orphaned labels. \u2728")
+		return 0
+	}
+
+	// Decide whether we can prompt. Without a real terminal (or with --dry-run)
+	// we print a read-only report and change nothing.
+	interactive := !*dryRun && stdin == os.Stdin && stdinIsTTY()
+
+	fmt.Fprintf(stdout, "\U0001FA7A stash-stash doctor\n\n")
+
+	if !interactive {
+		return doctorReport(stdout, dangling, orphans, *dryRun)
+	}
+	return doctorTriage(ctx, bufio.NewReader(stdin), stdout, stderr, store, dangling, orphans)
+}
+
+// knownSHAs returns the set of stash content SHAs that are accounted for: the
+// live stack plus every recoverable dangling commit. A sidecar entry keyed by
+// any of these is *not* an orphan (the work still exists somewhere), so the
+// doctor must not offer to delete its label. A List failure here degrades to
+// "only the dangling set is known", which at worst over-reports an orphan we
+// then let the user skip — never deletes a live stash's label silently.
+func knownSHAs(ctx context.Context, dangling []git.DanglingStash) map[string]struct{} {
+	known := make(map[string]struct{})
+	if live, err := gitList(ctx); err == nil {
+		for i := range live {
+			known[live[i].SHA] = struct{}{}
+		}
+	}
+	for i := range dangling {
+		known[dangling[i].SHA] = struct{}{}
+	}
+	return known
+}
+
+// doctorReport prints the read-only findings (non-TTY or --dry-run path) and
+// returns exit 0. It mirrors the interactive view's wording so the two modes
+// read the same, and ends with a hint about how to act on the findings.
+func doctorReport(stdout io.Writer, dangling []git.DanglingStash, orphans []meta.Orphan, dryRun bool) int {
+	if len(dangling) > 0 {
+		fmt.Fprintf(stdout, "Recoverable stashes (not in `git stash list`): %d\n", len(dangling))
+		for _, d := range dangling {
+			fmt.Fprintf(stdout, "  %s\n", doctorDanglingLine(d))
+		}
+		fmt.Fprintln(stdout)
+	}
+	if len(orphans) > 0 {
+		fmt.Fprintf(stdout, "Orphaned sidecar labels (stash is gone): %d\n", len(orphans))
+		for _, o := range orphans {
+			fmt.Fprintf(stdout, "  %s\n", doctorOrphanLine(o))
+		}
+		fmt.Fprintln(stdout)
+	}
+	if dryRun {
+		fmt.Fprintln(stdout, "Dry run \u2014 nothing changed. Re-run `stash-stash doctor` in a terminal to restore or clean up.")
+	} else {
+		fmt.Fprintln(stdout, "Run `stash-stash doctor` in an interactive terminal to restore stashes or remove orphaned labels.")
+	}
+	return 0
+}
+
+// doctorTriage walks the findings interactively, prompting per item. Restores
+// go through git.StoreStash (add-only); orphan deletions mutate the sidecar in
+// memory and are persisted once at the end (a single Save) so a long triage
+// doesn't rewrite the file repeatedly. It returns exit 0 once the user has
+// worked through every finding (or quit), 1 only if a sidecar Save fails after
+// real changes.
+func doctorTriage(ctx context.Context, in *bufio.Reader, stdout, stderr io.Writer, store *meta.Store, dangling []git.DanglingStash, orphans []meta.Orphan) int {
+	restored, removed := 0, 0
+
+	if len(dangling) > 0 {
+		fmt.Fprintf(stdout, "Found %d recoverable stash(es) not in `git stash list`:\n\n", len(dangling))
+	dangleLoop:
+		for _, d := range dangling {
+			fmt.Fprintf(stdout, "  %s\n", doctorDanglingLine(d))
+			for {
+				choice := prompt(in, stdout, "    [r]estore to stash list · [d]iff · [s]kip · [q]uit? ")
+				switch choice {
+				case "r", "restore":
+					if err := gitStoreStash(ctx, d.SHA, d.Subject); err != nil {
+						if errors.Is(err, git.ErrNotARepo) {
+							fmt.Fprintln(stderr, "stash-stash: not a git repository (run me inside one).")
+							return 1
+						}
+						fmt.Fprintf(stderr, "    could not restore: %v\n", err)
+					} else {
+						restored++
+						fmt.Fprintf(stdout, "    \u2705 restored as stash@{0}.\n")
+					}
+					continue dangleLoop
+				case "d", "diff":
+					doctorShowDiff(ctx, stdout, stderr, d.SHA)
+					// Loop again so the user can act after seeing the diff.
+				case "s", "skip", "":
+					continue dangleLoop
+				case "q", "quit":
+					break dangleLoop
+				default:
+					fmt.Fprintln(stdout, "    (please answer r, d, s, or q)")
+				}
+			}
+		}
+		fmt.Fprintln(stdout)
+	}
+
+	if len(orphans) > 0 {
+		fmt.Fprintf(stdout, "Found %d orphaned sidecar label(s) whose stash is gone:\n\n", len(orphans))
+	orphanLoop:
+		for _, o := range orphans {
+			fmt.Fprintf(stdout, "  %s\n", doctorOrphanLine(o))
+			for {
+				choice := prompt(in, stdout, "    [d]elete label · [s]kip · [q]uit? ")
+				switch choice {
+				case "d", "delete":
+					if store.Remove(o.SHA) {
+						removed++
+						fmt.Fprintf(stdout, "    \U0001F5D1\uFE0F  removed.\n")
+					}
+					continue orphanLoop
+				case "s", "skip", "":
+					continue orphanLoop
+				case "q", "quit":
+					break orphanLoop
+				default:
+					fmt.Fprintln(stdout, "    (please answer d, s, or q)")
+				}
+			}
+		}
+		fmt.Fprintln(stdout)
+	}
+
+	// Persist sidecar changes once, only if we actually removed something.
+	if removed > 0 {
+		if err := store.Save(); err != nil {
+			fmt.Fprintf(stderr, "stash-stash: removed %d label(s) in memory but could not save the sidecar (%v).\n", removed, err)
+			return 1
+		}
+	}
+
+	fmt.Fprintf(stdout, "Done. Restored %d stash(es), removed %d orphaned label(s).\n", restored, removed)
+	return 0
+}
+
+// doctorShowDiff prints the patch for a dangling stash commit so the user can
+// decide whether to restore it. It reuses gitShow (`git stash show -p` works on
+// a raw stash commit SHA too). A read failure is reported but non-fatal: the
+// triage continues so one unreadable commit can't derail recovery.
+func doctorShowDiff(ctx context.Context, stdout, stderr io.Writer, sha string) {
+	patch, err := gitShow(ctx, sha)
+	if err != nil {
+		fmt.Fprintf(stderr, "    could not show diff: %v\n", err)
+		return
+	}
+	if strings.TrimSpace(patch) == "" {
+		fmt.Fprintln(stdout, "    (empty diff)")
+		return
+	}
+	// Indent the patch a touch so it reads as nested under the entry.
+	for _, line := range strings.Split(strings.TrimRight(patch, "\n"), "\n") {
+		fmt.Fprintf(stdout, "    \u2502 %s\n", line)
+	}
+}
+
+// doctorDanglingLine formats a one-line summary of a recoverable stash for the
+// report and prompts: short SHA, age, source, and its subject/branch.
+func doctorDanglingLine(d git.DanglingStash) string {
+	age := "unknown age"
+	if !d.Created.IsZero() {
+		age = humanizeSince(now(), d.Created)
+	}
+	subject := d.Subject
+	if subject == "" {
+		subject = "(no subject)"
+	}
+	return fmt.Sprintf("%s  %s  [%s]  %s", shortSHA(d.SHA), age, d.Source, subject)
+}
+
+// doctorOrphanLine formats a one-line summary of an orphaned sidecar label.
+func doctorOrphanLine(o meta.Orphan) string {
+	label := o.Entry.Label
+	if label == "" {
+		label = "(no label)"
+	}
+	return fmt.Sprintf("%s  \u201C%s\u201D", shortSHA(o.SHA), label)
+}
+
+// shortSHA returns the first 12 chars of a SHA (or the whole thing if shorter),
+// matching the abbreviated form people are used to from git output.
+func shortSHA(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
+// humanizeSince renders an approximate, human-friendly age like "3 days" or
+// "2 hours" between an earlier and later time. It is intentionally coarse — the
+// doctor wants "roughly how old", not a precise duration.
+func humanizeSince(nowT, then time.Time) string {
+	d := nowT.Sub(then)
+	if d < 0 {
+		d = -d
+	}
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%d min", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return pluralCount(int(d.Hours()), "hour", "hours")
+	default:
+		return pluralCount(int(d.Hours()/24), "day", "days")
+	}
+}
+
+// pluralCount renders "<n> <unit>" picking the singular/plural noun for n.
+func pluralCount(n int, one, many string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, one)
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
+// prompt writes a prompt to stdout and reads one trimmed, lower-cased line from
+// in. On EOF (or a read error) it returns "q" so an interrupted/closed input
+// cleanly ends the triage rather than looping forever.
+func prompt(in *bufio.Reader, stdout io.Writer, label string) string {
+	fmt.Fprint(stdout, label)
+	line, err := in.ReadString('\n')
+	if err != nil && line == "" {
+		return "q"
+	}
+	return strings.ToLower(strings.TrimSpace(line))
 }
