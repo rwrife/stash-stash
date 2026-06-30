@@ -34,15 +34,16 @@ const fileName = "stash-stash.json"
 // tolerate unknown fields, so additive changes don't require a bump.
 const schemaVersion = 1
 
-// Entry is the per-stash metadata stash-stash persists. Only Label is used at
-// M4; Tags and Note are reserved for later milestones but defined now so the
-// JSON shape is forward-compatible and we don't need a schema bump later.
+// Entry is the per-stash metadata stash-stash persists. Label and Tags are
+// active; Note is reserved for a later milestone but defined now so the JSON
+// shape is forward-compatible and we don't need a schema bump later.
 type Entry struct {
 	// Label is the human-friendly name for the stash, e.g. "payments: retry fix".
 	Label string `json:"label,omitempty"`
 
-	// Tags are short classifiers (e.g. "wip", "experiment"). Reserved for a
-	// later milestone; persisted now for forward compatibility.
+	// Tags are short, slugified classifiers (e.g. "wip", "experiment"), kept
+	// sorted and de-duplicated. They drive `--tag` filtering and the TUI tag
+	// editor (issue #21).
 	Tags []string `json:"tags,omitempty"`
 
 	// Note is an optional multi-line "why". Reserved for a later milestone.
@@ -131,6 +132,129 @@ func loadFrom(path string) (*Store, error) {
 		s.Version = schemaVersion
 	}
 	return s, nil
+}
+
+// Tags returns a copy of the stored tags for a stash content SHA, in their
+// stored (sorted, de-duped) order. The returned slice is independent of the
+// store, so callers may sort or mutate it freely. An empty/unknown SHA yields
+// nil.
+func (s *Store) Tags(sha string) []string {
+	if s == nil || sha == "" {
+		return nil
+	}
+	e, ok := s.Entries[sha]
+	if !ok || len(e.Tags) == 0 {
+		return nil
+	}
+	out := make([]string, len(e.Tags))
+	copy(out, e.Tags)
+	return out
+}
+
+// SetTags replaces the tag set for a stash content SHA with the slugified,
+// de-duplicated, sorted form of tags and stamps UpdatedAt. Passing no usable
+// tags clears them; if that leaves the entry empty (no label/note) it is
+// removed entirely, keeping the sidecar tidy. It mutates the in-memory store
+// only; callers must Save to persist. A no-op (empty SHA) is ignored.
+func (s *Store) SetTags(sha string, tags []string) {
+	if s == nil || sha == "" {
+		return
+	}
+	if s.Entries == nil {
+		s.Entries = map[string]Entry{}
+	}
+	e := s.Entries[sha]
+	e.Tags = normalizeTags(tags)
+	e.UpdatedAt = time.Now().UTC()
+	if e.Label == "" && len(e.Tags) == 0 && e.Note == "" {
+		delete(s.Entries, sha)
+		return
+	}
+	s.Entries[sha] = e
+}
+
+// AddTags merges the slugified form of tags into the existing set for a stash
+// content SHA (union, de-duped, sorted) and stamps UpdatedAt. Tags that slug to
+// nothing are ignored; adding only such tags is a no-op that does not touch
+// UpdatedAt or create an entry. It mutates the in-memory store only; callers
+// must Save to persist.
+func (s *Store) AddTags(sha string, tags []string) {
+	if s == nil || sha == "" {
+		return
+	}
+	add := normalizeTags(tags)
+	if len(add) == 0 {
+		return
+	}
+	if s.Entries == nil {
+		s.Entries = map[string]Entry{}
+	}
+	e := s.Entries[sha]
+	e.Tags = normalizeTags(append(e.Tags, add...))
+	e.UpdatedAt = time.Now().UTC()
+	s.Entries[sha] = e
+}
+
+// RemoveTag drops a single tag (matched after slugification) from a stash
+// content SHA and reports whether anything was removed. Removing the last tag
+// when the entry carries no other metadata deletes the entry. It mutates the
+// in-memory store only; callers must Save to persist.
+func (s *Store) RemoveTag(sha, tag string) bool {
+	if s == nil || sha == "" {
+		return false
+	}
+	want := SlugTag(tag)
+	if want == "" {
+		return false
+	}
+	e, ok := s.Entries[sha]
+	if !ok {
+		return false
+	}
+	kept := e.Tags[:0:0]
+	removed := false
+	for _, t := range e.Tags {
+		if t == want {
+			removed = true
+			continue
+		}
+		kept = append(kept, t)
+	}
+	if !removed {
+		return false
+	}
+	e.Tags = kept
+	e.UpdatedAt = time.Now().UTC()
+	if e.Label == "" && len(e.Tags) == 0 && e.Note == "" {
+		delete(s.Entries, sha)
+		return true
+	}
+	s.Entries[sha] = e
+	return true
+}
+
+// HasAllTags reports whether the stash content SHA carries every tag in want
+// (AND semantics), after slugifying want. An empty want matches everything
+// (no filter). want entries that slug to nothing are ignored. This is the
+// predicate behind `--tag` filtering and the TUI live filter.
+func (s *Store) HasAllTags(sha string, want []string) bool {
+	need := normalizeTags(want)
+	if len(need) == 0 {
+		return true
+	}
+	if s == nil || sha == "" {
+		return false
+	}
+	have := make(map[string]struct{})
+	for _, t := range s.Entries[sha].Tags {
+		have[t] = struct{}{}
+	}
+	for _, t := range need {
+		if _, ok := have[t]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // Label returns the stored label for a stash content SHA, and whether one was
@@ -290,4 +414,88 @@ func isNotARepo(stderr []byte) bool {
 	msg := strings.ToLower(string(stderr))
 	return strings.Contains(msg, "not a git repository") ||
 		strings.Contains(msg, "this operation must be run in a work tree")
+}
+
+// SlugTag normalizes a single free-text tag into a compact, lowercase token:
+// it lower-cases, replaces any run of characters that aren't ASCII
+// alphanumerics into a single hyphen, and trims leading/trailing hyphens.
+// Examples:
+//
+//	"WIP"              -> "wip"
+//	"Hot Fix!"          -> "hot-fix"
+//	"  experiment  "    -> "experiment"
+//	"feature/login"     -> "feature-login"
+//	"---"               -> ""  (nothing usable)
+//
+// Unlike autolabel.Slug (which preserves '/'/'.' for git branch names), a tag
+// is a flat classifier, so every separator collapses to a single hyphen. A tag
+// that normalizes to nothing returns "", letting callers drop it.
+func SlugTag(tag string) string {
+	s := strings.ToLower(strings.TrimSpace(tag))
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	prevHyphen := false
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+			prevHyphen = false
+			continue
+		}
+		if !prevHyphen {
+			b.WriteByte('-')
+			prevHyphen = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+// normalizeTags slugifies every tag, drops the empties, de-duplicates, and
+// returns the result sorted for a stable on-disk and display order. It is the
+// single place tag hygiene happens so set/add/filter all agree. A nil/empty
+// input (or one with no usable tags) returns nil so an entry's Tags field stays
+// unset rather than an empty slice.
+func normalizeTags(tags []string) []string {
+	if len(tags) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(tags))
+	out := make([]string, 0, len(tags))
+	for _, t := range tags {
+		slug := SlugTag(t)
+		if slug == "" {
+			continue
+		}
+		if _, dup := seen[slug]; dup {
+			continue
+		}
+		seen[slug] = struct{}{}
+		out = append(out, slug)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
+}
+
+// NormalizeTags is the exported form of the package's tag-hygiene pass:
+// it slugifies, drops empties, de-duplicates, and sorts the given tags. It is
+// used by callers outside the package (e.g. the `--tag` filter) so the filter
+// matches stored tags exactly. Returns nil when nothing usable remains.
+func NormalizeTags(tags []string) []string {
+	return normalizeTags(tags)
+}
+
+// SplitTags parses a free-text, comma-separated tag entry (the TUI's `t`
+// editor and any CLI convenience) into normalized tags. "wip, Hot Fix ,,wip"
+// becomes ["hot-fix", "wip"]. It is a thin convenience over normalizeTags that
+// first splits on commas; whitespace-only fields are dropped.
+func SplitTags(entry string) []string {
+	if strings.TrimSpace(entry) == "" {
+		return nil
+	}
+	return normalizeTags(strings.Split(entry, ","))
 }

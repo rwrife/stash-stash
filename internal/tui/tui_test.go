@@ -35,15 +35,25 @@ func stubShow(ctx context.Context, ref string) (string, error) {
 // exercised.
 type fakeStore struct {
 	labels  map[string]string
+	tags    map[string][]string
 	saves   int
 	saveErr error
 	prunes  int // number of entries removed across Prune calls
 }
 
-func newFakeStore() *fakeStore { return &fakeStore{labels: map[string]string{}} }
+func newFakeStore() *fakeStore {
+	return &fakeStore{labels: map[string]string{}, tags: map[string][]string{}}
+}
 
 func (f *fakeStore) SetLabel(sha, label string) { f.labels[sha] = label }
-func (f *fakeStore) Save() error                { f.saves++; return f.saveErr }
+func (f *fakeStore) SetTags(sha string, tags []string) {
+	if len(tags) == 0 {
+		delete(f.tags, sha)
+		return
+	}
+	f.tags[sha] = append([]string(nil), tags...)
+}
+func (f *fakeStore) Save() error { f.saves++; return f.saveErr }
 
 // Prune drops labels whose SHA is not in liveSHAs, mirroring meta.Store.Prune,
 // so the action tests can assert the sidecar is cleaned after a pop/drop.
@@ -63,13 +73,13 @@ func (f *fakeStore) Prune(liveSHAs map[string]struct{}) int {
 // viewport and layout fields are populated (View would otherwise short-circuit).
 func sized(t *testing.T) Model {
 	t.Helper()
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	return updated.(Model)
 }
 
 func TestInitLoadsTopStash(t *testing.T) {
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0, nil)
 	cmd := m.Init()
 	if cmd == nil {
 		t.Fatal("Init() returned nil cmd, want a diff-load command")
@@ -88,7 +98,7 @@ func TestInitLoadsTopStash(t *testing.T) {
 }
 
 func TestInitEmptyStashesNoCmd(t *testing.T) {
-	m := New(nil, stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	m := New(nil, stubShow, newFakeStore(), Actions{}, fixedNow, 0, nil)
 	if cmd := m.Init(); cmd != nil {
 		t.Errorf("Init() with no stashes = non-nil cmd, want nil")
 	}
@@ -186,7 +196,7 @@ func TestViewRendersListAndPreview(t *testing.T) {
 }
 
 func TestViewBeforeSizeIsLoadingMessage(t *testing.T) {
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0, nil)
 	if got := m.View(); !strings.Contains(got, "Loading") {
 		t.Errorf("pre-size View() = %q, want a loading message", got)
 	}
@@ -258,7 +268,7 @@ func typeRunes(t *testing.T, m Model, s string) Model {
 
 func TestLabelEditSavesAndUpdatesList(t *testing.T) {
 	store := newFakeStore()
-	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -295,7 +305,7 @@ func TestLabelEditSavesAndUpdatesList(t *testing.T) {
 
 func TestLabelEditCancelDiscards(t *testing.T) {
 	store := newFakeStore()
-	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -323,7 +333,7 @@ func TestLabelEditEmptyClears(t *testing.T) {
 	store := newFakeStore()
 	stashes := sampleStashes()
 	stashes[0].Label = "old label" // pretend it was labeled
-	m := New(stashes, stubShow, store, Actions{}, fixedNow, 0)
+	m := New(stashes, stubShow, store, Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -346,7 +356,7 @@ func TestLabelEditEmptyClears(t *testing.T) {
 }
 
 func TestLabelDisabledWithoutStore(t *testing.T) {
-	m := New(sampleStashes(), stubShow, nil, Actions{}, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, nil, Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -360,7 +370,7 @@ func TestLabelDisabledWithoutStore(t *testing.T) {
 func TestLabelEditSaveErrorSurfaced(t *testing.T) {
 	store := newFakeStore()
 	store.saveErr = errTest
-	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -378,7 +388,7 @@ func TestLabelEditSaveErrorSurfaced(t *testing.T) {
 func TestListRendersLabelOverSubject(t *testing.T) {
 	stashes := sampleStashes()
 	stashes[1].Label = "feature work label"
-	m := New(stashes, stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	m := New(stashes, stubShow, newFakeStore(), Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -394,7 +404,7 @@ func TestListRendersAutoLabel(t *testing.T) {
 		{Index: 0, SHA: "aaa", Subject: "WIP on feature/payments: deadbeef",
 			Branch: "feature/payments", TopFile: "internal/retry.go", Created: fixedNow.Add(-time.Hour)},
 	}
-	m := New(stashes, stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	m := New(stashes, stubShow, newFakeStore(), Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 	m = updated.(Model)
 
@@ -491,7 +501,7 @@ func runCmd(t *testing.T, m Model, cmd tea.Cmd) Model {
 func TestApplyRunsImmediatelyWithToast(t *testing.T) {
 	var applied []string
 	actions := Actions{Apply: recordingAction(&applied, nil)}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -513,7 +523,7 @@ func TestApplyRunsImmediatelyWithToast(t *testing.T) {
 func TestDropAsksForConfirmation(t *testing.T) {
 	var dropped []string
 	actions := Actions{Drop: recordingAction(&dropped, nil), Reload: reloadReturning(nil, nil)}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -537,7 +547,7 @@ func TestDropAsksForConfirmation(t *testing.T) {
 func TestConfirmNoCancelsDrop(t *testing.T) {
 	var dropped []string
 	actions := Actions{Drop: recordingAction(&dropped, nil), Reload: reloadReturning(nil, nil)}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -574,7 +584,7 @@ func TestConfirmYesDropsPrunesAndReloads(t *testing.T) {
 	store.labels["bbb"] = "keeper"
 	actions := Actions{Drop: recordingAction(&dropped, nil), Reload: reloadReturning(remaining, nil)}
 
-	m := New(sampleStashes(), stubShow, store, actions, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, store, actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -612,7 +622,7 @@ func TestPopErrorSurfacesToast(t *testing.T) {
 		Pop:    recordingAction(new([]string), testErr("CONFLICT in foo.txt")),
 		Reload: reloadReturning(nil, nil),
 	}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -634,7 +644,7 @@ func TestPopErrorSurfacesToast(t *testing.T) {
 
 func TestActionUnavailableWithoutFunc(t *testing.T) {
 	// Zero Actions: pressing 'd' should neither confirm nor crash.
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
@@ -654,7 +664,7 @@ func TestDropLastStashShowsEmptyState(t *testing.T) {
 	// A single stash; dropping it empties the list.
 	one := []model.Stash{{Index: 0, SHA: "solo", Subject: "WIP on main: only", Branch: "main", Created: fixedNow.Add(-time.Hour)}}
 	actions := Actions{Drop: recordingAction(new([]string), nil), Reload: reloadReturning(nil, nil)}
-	m := New(one, stubShow, newFakeStore(), actions, fixedNow, 0)
+	m := New(one, stubShow, newFakeStore(), actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -674,7 +684,7 @@ func TestDropLastStashShowsEmptyState(t *testing.T) {
 
 func TestBusyLocksInput(t *testing.T) {
 	// While busy, navigation keys are ignored (only ctrl+c quits).
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 	m.busy = true
@@ -691,7 +701,7 @@ func TestBusyLocksInput(t *testing.T) {
 func TestDustBannerAndMarker(t *testing.T) {
 	// sampleStashes are 2h / 48h / 72h old. With a 2-day threshold the latter
 	// two are dusty, so the title row nags and stale ages get a trailing "*".
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 2)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 2, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 	out := stripANSI(m.View())
@@ -711,7 +721,7 @@ func TestDustBannerAndMarker(t *testing.T) {
 
 func TestDustBannerDisabled(t *testing.T) {
 	// staleDays=0 disables the nag entirely even for old stashes.
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 	out := stripANSI(m.View())
@@ -728,7 +738,7 @@ func TestBranchKeyOpensEditorWithSuggestion(t *testing.T) {
 	stashes := sampleStashes()
 	stashes[1].Label = "Payments: fix retry"
 	actions := Actions{Branch: recordingBranch(new([]branchCall), nil), Reload: reloadReturning(nil, nil)}
-	m := New(stashes, stubShow, newFakeStore(), actions, fixedNow, 0)
+	m := New(stashes, stubShow, newFakeStore(), actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -765,7 +775,7 @@ func TestBranchCommitFiresBranchAndResyncs(t *testing.T) {
 	store.labels["bbb"] = "keeper"
 	actions := Actions{Branch: recordingBranch(&calls, nil), Reload: reloadReturning(remaining, nil)}
 
-	m := New(sampleStashes(), stubShow, store, actions, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, store, actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -807,7 +817,7 @@ func TestBranchCommitFiresBranchAndResyncs(t *testing.T) {
 func TestBranchEditCancelDiscards(t *testing.T) {
 	var calls []branchCall
 	actions := Actions{Branch: recordingBranch(&calls, nil), Reload: reloadReturning(nil, nil)}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -831,7 +841,7 @@ func TestBranchEditCancelDiscards(t *testing.T) {
 func TestBranchEmptyNameRejected(t *testing.T) {
 	var calls []branchCall
 	actions := Actions{Branch: recordingBranch(&calls, nil), Reload: reloadReturning(nil, nil)}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -859,7 +869,7 @@ func TestBranchEmptyNameRejected(t *testing.T) {
 
 func TestBranchUnavailableWithoutFunc(t *testing.T) {
 	// Zero Actions: pressing 'b' should neither open the editor nor crash.
-	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), Actions{}, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
@@ -877,7 +887,7 @@ func TestBranchErrorSurfacesToast(t *testing.T) {
 		Branch: recordingBranch(new([]branchCall), testErr("CONFLICT: could not apply stash")),
 		Reload: reloadReturning(nil, nil),
 	}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -900,7 +910,7 @@ func TestBranchErrorSurfacesToast(t *testing.T) {
 func TestBranchingSwallowsNavigationKeys(t *testing.T) {
 	// While branching, 'j' is text in the name field, not a cursor move.
 	actions := Actions{Branch: recordingBranch(new([]branchCall), nil), Reload: reloadReturning(nil, nil)}
-	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0)
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
@@ -922,7 +932,7 @@ func TestBranchLastStashShowsEmptyState(t *testing.T) {
 	// A single stash; branching it empties the list.
 	one := []model.Stash{{Index: 0, SHA: "solo", Subject: "WIP on main: only", Branch: "main", Created: fixedNow.Add(-time.Hour)}}
 	actions := Actions{Branch: recordingBranch(new([]branchCall), nil), Reload: reloadReturning(nil, nil)}
-	m := New(one, stubShow, newFakeStore(), actions, fixedNow, 0)
+	m := New(one, stubShow, newFakeStore(), actions, fixedNow, 0, nil)
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m = updated.(Model)
 
@@ -945,4 +955,192 @@ func TestHelpLineMentionsBranch(t *testing.T) {
 	if !strings.Contains(stripANSI(m.footer()), "b branch") {
 		t.Errorf("help line = %q, want it to mention 'b branch'", stripANSI(m.footer()))
 	}
+}
+
+// --- issue #21: tags & filtering ---
+
+func TestTagEditSavesAndUpdatesList(t *testing.T) {
+	store := newFakeStore()
+	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow, 0, nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	// Open the tag editor on stash@{0} (SHA "aaa") with 't'.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	m = updated.(Model)
+	if !m.tagging {
+		t.Fatal("'t' did not open the tag editor")
+	}
+
+	// Comma-separated, messy entry; commit with Enter.
+	m = typeRunes(t, m, "WIP, Hot Fix , wip")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.tagging {
+		t.Error("tag editor still open after Enter")
+	}
+	want := []string{"hot-fix", "wip"}
+	if got := store.tags["aaa"]; !equalStrings(got, want) {
+		t.Errorf("store tags for aaa = %v, want %v", got, want)
+	}
+	if store.saves != 1 {
+		t.Errorf("Save called %d times, want 1", store.saves)
+	}
+	if got := m.stashes[0].Tags; !equalStrings(got, want) {
+		t.Errorf("in-memory tags = %v, want %v", got, want)
+	}
+	if out := stripANSI(m.View()); !strings.Contains(out, "#wip") || !strings.Contains(out, "#hot-fix") {
+		t.Errorf("View() does not show tags:\n%s", out)
+	}
+}
+
+func TestTagEditCancelDiscards(t *testing.T) {
+	store := newFakeStore()
+	m := New(sampleStashes(), stubShow, store, Actions{}, fixedNow, 0, nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	m = updated.(Model)
+	m = typeRunes(t, m, "throwaway")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.tagging {
+		t.Error("Esc did not close the tag editor")
+	}
+	if _, ok := store.tags["aaa"]; ok {
+		t.Error("cancelled tag edit still wrote to the store")
+	}
+	if store.saves != 0 {
+		t.Errorf("Save called %d times on cancel, want 0", store.saves)
+	}
+}
+
+func TestFilterNarrowsVisibleList(t *testing.T) {
+	store := newFakeStore()
+	stashes := sampleStashes()
+	stashes[0].Tags = []string{"wip"}
+	stashes[2].Tags = []string{"wip", "hotfix"}
+	m := New(stashes, stubShow, store, Actions{}, fixedNow, 0, nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	// All three visible before filtering.
+	if got := len(m.visible()); got != 3 {
+		t.Fatalf("visible before filter = %d, want 3", got)
+	}
+
+	// Open filter with '/', type a tag, apply.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	if !m.filtering {
+		t.Fatal("'/' did not open the filter prompt")
+	}
+	m = typeRunes(t, m, "wip")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if m.filtering {
+		t.Error("filter prompt still open after Enter")
+	}
+	v := m.visible()
+	if len(v) != 2 {
+		t.Fatalf("visible after #wip filter = %d, want 2", len(v))
+	}
+	for _, s := range v {
+		if s.SHA == "bbb" {
+			t.Error("untagged stash bbb leaked through the #wip filter")
+		}
+	}
+
+	// Tighten to #wip #hotfix → only ccc. Reopening the prompt seeds the prior
+	// filter ("wip"); clear it first, then type the full AND filter.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
+	m = updated.(Model)
+	for i := 0; i < 20; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+	m = typeRunes(t, m, "wip, hotfix")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if v := m.visible(); len(v) != 1 || v[0].SHA != "ccc" {
+		t.Errorf("AND filter visible = %+v, want only ccc", v)
+	}
+
+	// Clear filter (empty entry) → all three back.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	m = updated.(Model)
+	for i := 0; i < 20; i++ { // backspace any seeded text
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if got := len(m.visible()); got != 3 {
+		t.Errorf("visible after clearing filter = %d, want 3", got)
+	}
+}
+
+func TestInitialFilterSeedsView(t *testing.T) {
+	stashes := sampleStashes()
+	stashes[1].Tags = []string{"experiment"}
+	m := New(stashes, stubShow, newFakeStore(), Actions{}, fixedNow, 0, []string{"experiment"})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+	if v := m.visible(); len(v) != 1 || v[0].SHA != "bbb" {
+		t.Errorf("initial-filter visible = %+v, want only bbb", v)
+	}
+	if !strings.Contains(stripANSI(m.View()), "filter:") {
+		t.Error("active filter not shown in title")
+	}
+}
+
+func TestTagEditMovesSelectionOutOfFilter(t *testing.T) {
+	store := newFakeStore()
+	stashes := sampleStashes()
+	stashes[0].Tags = []string{"wip"}
+	stashes[2].Tags = []string{"wip"}
+	// Start filtered to #wip → aaa, ccc visible; cursor on aaa.
+	m := New(stashes, stubShow, store, Actions{}, fixedNow, 0, []string{"wip"})
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+	if got := len(m.visible()); got != 2 {
+		t.Fatalf("pre-edit visible = %d, want 2", got)
+	}
+
+	// Retag the selected stash (aaa) to drop #wip; it should leave the view.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'t'}})
+	m = updated.(Model)
+	// Clear the seeded "wip" then type "review".
+	for i := 0; i < 20; i++ {
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+		m = updated.(Model)
+	}
+	m = typeRunes(t, m, "review")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	v := m.visible()
+	if len(v) != 1 || v[0].SHA != "ccc" {
+		t.Errorf("after retag, visible = %+v, want only ccc", v)
+	}
+	if m.cursor < 0 || m.cursor >= len(v) {
+		t.Errorf("cursor %d out of range after filter shrank to %d", m.cursor, len(v))
+	}
+}
+
+// equalStrings compares two string slices element-wise (both nil counts equal).
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

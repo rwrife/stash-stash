@@ -39,7 +39,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/rwrife/stash-stash/internal/age"
+	"github.com/rwrife/stash-stash/internal/meta"
 	"github.com/rwrife/stash-stash/internal/model"
+	"github.com/rwrife/stash-stash/internal/render"
 )
 
 // ShowFunc loads the patch for a stash ref (e.g. "stash@{0}"). It mirrors
@@ -74,11 +76,12 @@ type Actions struct {
 	Reload ReloadFunc
 }
 
-// labeler is the subset of *meta.Store the TUI needs to persist relabels and
-// prune removed stashes. An interface keeps the model testable with an
-// in-memory fake and lets a nil store disable labeling gracefully.
+// labeler is the subset of *meta.Store the TUI needs to persist relabels, tag
+// edits, and prune removed stashes. An interface keeps the model testable with
+// an in-memory fake and lets a nil store disable labeling/tagging gracefully.
 type labeler interface {
 	SetLabel(sha, label string)
+	SetTags(sha string, tags []string)
 	Save() error
 }
 
@@ -148,6 +151,14 @@ var (
 	// bannerStyle frames the "gathering dust" nag in the title row: amber on
 	// nothing, bold, so it reads as a gentle alert.
 	bannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Padding(0, 1)
+
+	// tagStyle renders a stash row's compact "#tag" tokens: a cool teal so they
+	// read as metadata, distinct from the amber label and blue branch lines.
+	tagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("79"))
+
+	// filterStyle frames the active tag filter in the title row, echoing the
+	// teal of the row tags so the connection is obvious.
+	filterStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("79")).Padding(0, 1)
 
 	// Age token colors by staleness bucket, applied to the age in each row.
 	// Fresh stays dim (no special attention), aging goes amber, stale orange,
@@ -280,6 +291,19 @@ type Model struct {
 	input   textinput.Model // the label text field (valid while editing)
 	notice  string          // transient status line (e.g. "saved"/error)
 
+	// --- issue #21: tags & filtering ---
+	// tagging is true while the inline tag editor is open. Like branching it
+	// shares the `input` field but commits to a tag-set update rather than a
+	// relabel, so it is tracked separately and is mutually exclusive with the
+	// other inline editors.
+	tagging bool
+	// filtering is true while the inline live-filter prompt is open; filterTags
+	// holds the currently-applied (normalized) tag filter. When non-empty, only
+	// stashes carrying all of filterTags are shown. cursor/preview operate on the
+	// filtered view via visibleStashes()/visibleIndex().
+	filtering  bool
+	filterTags []string
+
 	// --- issue #9: stash -> branch ---
 	// branching is true while the inline branch-name editor is open. It shares
 	// the `input` field with the label editor but commits to a different action
@@ -298,37 +322,88 @@ type Model struct {
 }
 
 // New builds a Model over the given stashes, using show to fetch diffs, store
-// to persist relabels (may be nil to disable labeling), actions to perform the
-// mutating apply/pop/drop operations (a zero Actions disables them), now to
-// compute ages, and staleDays as the staleness threshold (0 disables the nag
-// and stale coloring). The caller is responsible for the empty-stash and
+// to persist relabels/tags (may be nil to disable labeling/tagging), actions to
+// perform the mutating apply/pop/drop operations (a zero Actions disables
+// them), now to compute ages, and staleDays as the staleness threshold (0
+// disables the nag and stale coloring). initialFilter (normalized tags) seeds
+// the live tag filter so a `--tag` invocation opens the browser pre-filtered
+// (empty means "show all"). The caller is responsible for the empty-stash and
 // not-a-repo cases before reaching the TUI.
-func New(stashes []model.Stash, show ShowFunc, store labeler, actions Actions, now time.Time, staleDays int) Model {
+func New(stashes []model.Stash, show ShowFunc, store labeler, actions Actions, now time.Time, staleDays int, initialFilter []string) Model {
 	return Model{
-		stashes:   stashes,
-		show:      show,
-		store:     store,
-		actions:   actions,
-		now:       now,
-		staleDays: staleDays,
-		loadedFor: -1,
+		stashes:    stashes,
+		show:       show,
+		store:      store,
+		actions:    actions,
+		now:        now,
+		staleDays:  staleDays,
+		filterTags: append([]string(nil), initialFilter...),
+		loadedFor:  -1,
 	}
 }
 
-// Init triggers the first diff load for the top stash.
+// Init triggers the first diff load for the top visible stash.
 func (m Model) Init() tea.Cmd {
-	if len(m.stashes) == 0 {
+	if len(m.visible()) == 0 {
 		return nil
 	}
 	return m.loadDiffCmd(m.cursor)
 }
 
-// loadDiffCmd returns a command that loads the diff for the stash at idx.
+// visible returns the stashes currently shown: all of them when no tag filter
+// is active, otherwise only those carrying every tag in filterTags (AND). The
+// cursor and all row rendering index into this view, so navigation and the
+// preview always track what the user can see. The returned slice is a fresh
+// slice header (its elements alias m.stashes) so reads are cheap and safe.
+func (m Model) visible() []model.Stash {
+	if len(m.filterTags) == 0 {
+		return m.stashes
+	}
+	out := make([]model.Stash, 0, len(m.stashes))
+	for i := range m.stashes {
+		if m.stashes[i].HasAllTags(m.filterTags) {
+			out = append(out, m.stashes[i])
+		}
+	}
+	return out
+}
+
+// selected returns the visible stash under the cursor and true, or a zero
+// Stash and false when the visible list is empty (e.g. a filter matched
+// nothing). Mutating handlers use the returned stash's SHA to find/update the
+// underlying entry in m.stashes, since the filtered view is read-only.
+func (m Model) selected() (model.Stash, bool) {
+	v := m.visible()
+	if m.cursor < 0 || m.cursor >= len(v) {
+		return model.Stash{}, false
+	}
+	return v[m.cursor], true
+}
+
+// stashIndexBySHA returns the index of the stash with the given content SHA in
+// the full m.stashes slice, or -1. Filter-aware handlers resolve the visible
+// selection back to the underlying entry through this so edits land on the
+// real stash regardless of filtering.
+func (m Model) stashIndexBySHA(sha string) int {
+	if sha == "" {
+		return -1
+	}
+	for i := range m.stashes {
+		if m.stashes[i].SHA == sha {
+			return i
+		}
+	}
+	return -1
+}
+
+// loadDiffCmd returns a command that loads the diff for the visible stash at
+// idx (an index into the filtered view).
 func (m Model) loadDiffCmd(idx int) tea.Cmd {
-	if idx < 0 || idx >= len(m.stashes) {
+	v := m.visible()
+	if idx < 0 || idx >= len(v) {
 		return nil
 	}
-	ref := m.stashes[idx].Ref()
+	ref := v[idx].Ref()
 	show := m.show
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -386,6 +461,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.editing {
 		return m.handleEditKey(msg)
 	}
+	if m.tagging {
+		return m.handleTagKey(msg)
+	}
+	if m.filtering {
+		return m.handleFilterKey(msg)
+	}
 	if m.branching {
 		return m.handleBranchKey(msg)
 	}
@@ -412,12 +493,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "home", "g":
 		return m.moveCursorTo(0)
 	case "end", "G":
-		return m.moveCursorTo(len(m.stashes) - 1)
+		return m.moveCursorTo(len(m.visible()) - 1)
 
 	case "l":
 		return m.beginEdit()
+	case "t":
+		return m.beginTag()
 	case "b":
 		return m.beginBranch()
+	case "/", "f":
+		return m.beginFilter()
 
 	case "a":
 		return m.startAction(actionApply)
@@ -444,14 +529,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // with the current label (empty for an unlabeled stash). It is a no-op when
 // labeling is disabled (no store) or there is no selection.
 func (m Model) beginEdit() (tea.Model, tea.Cmd) {
-	if m.store == nil || len(m.stashes) == 0 {
-		m.notice = "labeling unavailable (no sidecar)"
+	sel, ok := m.selected()
+	if m.store == nil || !ok {
+		if m.store == nil {
+			m.notice = "labeling unavailable (no sidecar)"
+		}
 		return m, nil
 	}
 	ti := textinput.New()
 	ti.Prompt = ""
 	ti.CharLimit = 120
-	ti.SetValue(m.stashes[m.cursor].Label)
+	ti.SetValue(sel.Label)
 	ti.CursorEnd()
 	// Width is set to the list inner width minus the prompt label in View;
 	// a sane default keeps it usable before the first resize.
@@ -488,13 +576,18 @@ func (m Model) handleEditKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // the notice line but never crash the TUI.
 func (m Model) commitEdit() (tea.Model, tea.Cmd) {
 	m.editing = false
-	if len(m.stashes) == 0 || m.store == nil {
+	sel, ok := m.selected()
+	if !ok || m.store == nil {
+		return m, nil
+	}
+	idx := m.stashIndexBySHA(sel.SHA)
+	if idx < 0 {
 		return m, nil
 	}
 	label := strings.TrimSpace(m.input.Value())
-	sha := m.stashes[m.cursor].SHA
+	sha := m.stashes[idx].SHA
 	m.store.SetLabel(sha, label)
-	m.stashes[m.cursor].Label = label
+	m.stashes[idx].Label = label
 	if err := m.store.Save(); err != nil {
 		m.notice = "save failed: " + err.Error()
 		return m, nil
@@ -507,6 +600,210 @@ func (m Model) commitEdit() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// beginTag opens the inline tag editor for the selected (visible) stash, seeding
+// it with the current tags as a comma-separated list (issue #21). Committing it
+// replaces the stash's tag set with the slugified, de-duped entry. It is a
+// no-op (with a toast) when tagging is disabled (no store) or there is no
+// selection.
+func (m Model) beginTag() (tea.Model, tea.Cmd) {
+	sel, ok := m.selected()
+	if m.store == nil || !ok {
+		if m.store == nil {
+			m.notice = "tagging unavailable (no sidecar)"
+		}
+		return m, nil
+	}
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.CharLimit = 200
+	ti.Placeholder = "wip, experiment, hotfix"
+	ti.SetValue(strings.Join(sel.Tags, ", "))
+	ti.CursorEnd()
+	ti.Width = m.listInnerW
+	if ti.Width < 8 {
+		ti.Width = 8
+	}
+	ti.Focus()
+	m.input = ti
+	m.tagging = true
+	m.notice = ""
+	return m, textinput.Blink
+}
+
+// handleTagKey drives the inline tag editor: Enter commits, Esc cancels,
+// everything else edits the text field.
+func (m Model) handleTagKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		return m.commitTag()
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.tagging = false
+		m.notice = "tag edit cancelled"
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+// commitTag persists the edited tag set to the sidecar (keyed by content SHA)
+// and updates the in-memory stash so the list reflects it immediately. The
+// comma-separated entry is slugified, de-duped, and sorted by meta.SplitTags;
+// an empty entry clears all tags. Save failures surface in the notice line but
+// never crash the TUI. Because a tag change can move a stash in or out of an
+// active filter, the cursor is re-clamped and the preview reloaded afterwards.
+func (m Model) commitTag() (tea.Model, tea.Cmd) {
+	m.tagging = false
+	sel, ok := m.selected()
+	if !ok || m.store == nil {
+		return m, nil
+	}
+	idx := m.stashIndexBySHA(sel.SHA)
+	if idx < 0 {
+		return m, nil
+	}
+	tags := meta.SplitTags(m.input.Value())
+	sha := m.stashes[idx].SHA
+	m.store.SetTags(sha, tags)
+	m.stashes[idx].Tags = tags
+	if err := m.store.Save(); err != nil {
+		m.notice = "save failed: " + err.Error()
+		return m, m.resyncAfterFilterChange(sha)
+	}
+	if len(tags) == 0 {
+		m.notice = "tags cleared"
+	} else {
+		m.notice = "tags saved: " + render.FormatTags(tags)
+	}
+	return m, m.resyncAfterFilterChange(sha)
+}
+
+// beginFilter opens the inline live-filter prompt, seeded with the currently
+// applied filter as a comma-separated list (issue #21). Committing it narrows
+// the visible list to stashes carrying all the entered tags (AND); an empty
+// entry clears the filter. Unlike labeling/tagging it needs no sidecar store —
+// it only reads tags already loaded onto the stashes.
+func (m Model) beginFilter() (tea.Model, tea.Cmd) {
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.CharLimit = 200
+	ti.Placeholder = "wip, hotfix"
+	ti.SetValue(strings.Join(m.filterTags, ", "))
+	ti.CursorEnd()
+	ti.Width = m.listInnerW
+	if ti.Width < 8 {
+		ti.Width = 8
+	}
+	ti.Focus()
+	m.input = ti
+	m.filtering = true
+	m.notice = ""
+	return m, textinput.Blink
+}
+
+// handleFilterKey drives the inline live-filter prompt: Enter applies the
+// filter, Esc cancels (leaving the prior filter untouched), everything else
+// edits the text field.
+func (m Model) handleFilterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		return m.commitFilter()
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.filtering = false
+		m.notice = "filter unchanged"
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+// commitFilter applies the entered (comma-separated) tag filter, normalizing it
+// to the slugified form so it matches stored tags. The cursor is reset to the
+// top of the new visible list and that stash's diff is (re)loaded. An empty
+// entry clears the filter and shows everything again.
+func (m Model) commitFilter() (tea.Model, tea.Cmd) {
+	m.filtering = false
+	m.filterTags = meta.SplitTags(m.input.Value())
+	if len(m.filterTags) == 0 {
+		m.notice = "filter cleared"
+	} else {
+		m.notice = "filtering: " + render.FormatTags(m.filterTags)
+	}
+	return m, m.refilter()
+}
+
+// refilter resets selection to the top of the (possibly newly-)filtered view
+// and reloads that stash's diff. When the filter matches nothing it clears the
+// preview to an explanatory note. It is the shared tail of filter changes.
+func (m Model) refilter() tea.Cmd {
+	m.cursor = 0
+	v := m.visible()
+	if len(v) == 0 {
+		m.loadedFor = -1
+		m.currentDiff = ""
+		m.loading = false
+		if m.ready {
+			m.viewport.SetContent(dimStyle.Render("No stashes match this tag filter. Press / to change it."))
+			m.viewport.GotoTop()
+		}
+		return nil
+	}
+	m.loadedFor = -1
+	m.loading = true
+	if m.ready {
+		m.viewport.SetContent(dimStyle.Render("Loading diff…"))
+		m.viewport.GotoTop()
+	}
+	return m.loadDiffCmd(m.cursor)
+}
+
+// resyncAfterFilterChange keeps the selection sensible after a tag edit that
+// may have moved the edited stash out of (or kept it in) an active filter. With
+// no filter it is a no-op (the row simply re-renders). With a filter it tries
+// to keep the cursor on the edited stash if it is still visible, otherwise
+// clamps to the new list and reloads the preview.
+func (m *Model) resyncAfterFilterChange(sha string) tea.Cmd {
+	if len(m.filterTags) == 0 {
+		return nil
+	}
+	v := m.visible()
+	if len(v) == 0 {
+		m.cursor = 0
+		m.loadedFor = -1
+		m.currentDiff = ""
+		m.loading = false
+		if m.ready {
+			m.viewport.SetContent(dimStyle.Render("No stashes match this tag filter. Press / to change it."))
+			m.viewport.GotoTop()
+		}
+		return nil
+	}
+	// Prefer to stay on the edited stash if it is still in view.
+	for i := range v {
+		if v[i].SHA == sha {
+			if i == m.cursor {
+				return nil // unchanged position; row re-renders in place
+			}
+			m.cursor = i
+			m.loadedFor = -1
+			m.loading = true
+			return m.loadDiffCmd(m.cursor)
+		}
+	}
+	// Edited stash fell out of the filter: clamp and reload.
+	if m.cursor > len(v)-1 {
+		m.cursor = len(v) - 1
+	}
+	m.loadedFor = -1
+	m.loading = true
+	if m.ready {
+		m.viewport.SetContent(dimStyle.Render("Loading diff…"))
+		m.viewport.GotoTop()
+	}
+	return m.loadDiffCmd(m.cursor)
+}
+
 // beginBranch opens the inline branch-name editor for the selected stash,
 // seeding it with a slugified suggestion derived from the stash's label
 // (issue #9). Committing it runs `git stash branch`. It is a no-op (with a
@@ -514,7 +811,8 @@ func (m Model) commitEdit() (tea.Model, tea.Cmd) {
 // no selection. Unlike labeling it does not require a sidecar store — promoting
 // a stash to a branch is a pure git operation.
 func (m Model) beginBranch() (tea.Model, tea.Cmd) {
-	if len(m.stashes) == 0 {
+	sel, ok := m.selected()
+	if !ok {
 		return m, nil
 	}
 	if m.actions.Branch == nil {
@@ -524,7 +822,7 @@ func (m Model) beginBranch() (tea.Model, tea.Cmd) {
 	ti := textinput.New()
 	ti.Prompt = ""
 	ti.CharLimit = 120
-	ti.SetValue(m.stashes[m.cursor].BranchSuggestion())
+	ti.SetValue(sel.BranchSuggestion())
 	ti.CursorEnd()
 	ti.Width = m.listInnerW
 	if ti.Width < 8 {
@@ -560,7 +858,7 @@ func (m Model) handleBranchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // to the new branch and removed, so the result is handled like a pop/drop.
 func (m Model) commitBranch() (tea.Model, tea.Cmd) {
 	m.branching = false
-	if len(m.stashes) == 0 || m.actions.Branch == nil {
+	if _, ok := m.selected(); !ok || m.actions.Branch == nil {
 		return m, nil
 	}
 	name := strings.TrimSpace(m.input.Value())
@@ -584,7 +882,7 @@ func (m Model) moveCursor(delta int) (tea.Model, tea.Cmd) {
 // no-op (with an explanatory toast) when the action is unavailable (no injected
 // func) or there is no selection.
 func (m Model) startAction(kind actionKind) (tea.Model, tea.Cmd) {
-	if len(m.stashes) == 0 {
+	if _, ok := m.selected(); !ok {
 		return m, nil
 	}
 	if m.actionFunc(kind) == nil {
@@ -633,10 +931,10 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // op against the selected stash. The captured ref/SHA travel with the result
 // so the post-mutation handler can act even though indices may shift.
 func (m Model) fireAction(kind actionKind) (tea.Model, tea.Cmd) {
-	if len(m.stashes) == 0 {
+	s, ok := m.selected()
+	if !ok {
 		return m, nil
 	}
-	s := m.stashes[m.cursor]
 	m.busy = true
 	m.notice = capitalize(m.gerund(kind)) + " " + s.Ref() + "…"
 	return m, m.runActionCmd(kind, s.Ref(), s.SHA)
@@ -648,10 +946,10 @@ func (m Model) fireAction(kind actionKind) (tea.Model, tea.Cmd) {
 // branch name travels in the closure. A successful branch removes the stash, so
 // the result is handled exactly like a pop/drop (reload + prune).
 func (m Model) fireBranch(name string) (tea.Model, tea.Cmd) {
-	if len(m.stashes) == 0 {
+	s, ok := m.selected()
+	if !ok {
 		return m, nil
 	}
-	s := m.stashes[m.cursor]
 	m.busy = true
 	m.notice = "Branching " + s.Ref() + " → " + name + "…"
 	return m, m.runBranchCmd(name, s.Ref(), s.SHA)
@@ -759,7 +1057,7 @@ func (m Model) handleActionDone(msg actionDoneMsg) (tea.Model, tea.Cmd) {
 	m.stashes = msg.reloaded
 	m.notice = msg.ref + " " + msg.kind.verb()
 
-	// No stashes left: nothing more to preview. The View renders an empty
+	// No stashes left at all: nothing more to preview. The View renders an empty
 	// state; quitting is up to the user.
 	if len(m.stashes) == 0 {
 		m.cursor = 0
@@ -769,9 +1067,20 @@ func (m Model) handleActionDone(msg actionDoneMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Clamp the cursor (the list likely shrank) and reload that stash's diff.
-	if m.cursor > len(m.stashes)-1 {
-		m.cursor = len(m.stashes) - 1
+	// Clamp the cursor against the *visible* list (a filter may be active and the
+	// list likely shrank) and reload that stash's diff. If the filter now matches
+	// nothing, show an explanatory note instead.
+	v := m.visible()
+	if len(v) == 0 {
+		m.cursor = 0
+		m.loadedFor = -1
+		m.currentDiff = ""
+		m.viewport.SetContent(dimStyle.Render("No stashes match this tag filter. Press / to change it."))
+		m.viewport.GotoTop()
+		return m, nil
+	}
+	if m.cursor > len(v)-1 {
+		m.cursor = len(v) - 1
 	}
 	m.loadedFor = -1
 	m.loading = true
@@ -780,17 +1089,18 @@ func (m Model) handleActionDone(msg actionDoneMsg) (tea.Model, tea.Cmd) {
 	return m, m.loadDiffCmd(m.cursor)
 }
 
-// moveCursorTo clamps to a valid row and triggers a diff load when the
-// selection actually changes.
+// moveCursorTo clamps to a valid row in the visible list and triggers a diff
+// load when the selection actually changes.
 func (m Model) moveCursorTo(idx int) (tea.Model, tea.Cmd) {
-	if len(m.stashes) == 0 {
+	n := len(m.visible())
+	if n == 0 {
 		return m, nil
 	}
 	if idx < 0 {
 		idx = 0
 	}
-	if idx > len(m.stashes)-1 {
-		idx = len(m.stashes) - 1
+	if idx > n-1 {
+		idx = n - 1
 	}
 	if idx == m.cursor {
 		return m, nil
@@ -851,12 +1161,19 @@ func (m Model) View() string {
 		return "Loading stash-stash…"
 	}
 
-	title := titleStyle.Render(fmt.Sprintf("🪦 stash-stash — %d %s",
-		len(m.stashes), plural(len(m.stashes), "stash", "stashes")))
+	title := titleStyle.Render(m.titleText())
 
-	// Append the "gathering dust" nag to the title row when any stash is dusty.
+	// Append the "gathering dust" nag to the title row when any visible stash is
+	// dusty.
 	if banner := m.dustBanner(); banner != "" {
 		title = lipgloss.JoinHorizontal(lipgloss.Top, title, bannerStyle.Render(banner))
+	}
+
+	// When a tag filter is active, show it in the title row so the narrowed view
+	// is never a mystery.
+	if len(m.filterTags) > 0 {
+		title = lipgloss.JoinHorizontal(lipgloss.Top, title,
+			filterStyle.Render("filter: "+render.FormatTags(m.filterTags)))
 	}
 
 	list := listPaneStyle.
@@ -874,30 +1191,54 @@ func (m Model) View() string {
 	return lipgloss.JoinVertical(lipgloss.Left, title, panes, m.footer())
 }
 
-// footer renders the bottom line of the UI: the inline label editor (while
-// editing), a destructive-action confirm prompt (while confirming), a transient
-// notice, or the key help.
+// titleText renders the title's count, accounting for an active tag filter by
+// showing "<visible> of <total>" so the user knows the list is narrowed.
+func (m Model) titleText() string {
+	total := len(m.stashes)
+	if len(m.filterTags) == 0 {
+		return fmt.Sprintf("🪦 stash-stash — %d %s", total, plural(total, "stash", "stashes"))
+	}
+	shown := len(m.visible())
+	return fmt.Sprintf("🪦 stash-stash — %d of %d %s", shown, total, plural(total, "stash", "stashes"))
+}
+
+// footer renders the bottom line of the UI: the inline label/tag/branch/filter
+// editor (while one is open), a destructive-action confirm prompt (while
+// confirming), a transient notice, or the key help.
 func (m Model) footer() string {
+	sel, haveSel := m.selected()
 	if m.editing {
 		label := "label"
-		if m.cursor >= 0 && m.cursor < len(m.stashes) {
-			label = "label " + m.stashes[m.cursor].Ref()
+		if haveSel {
+			label = "label " + sel.Ref()
 		}
 		return editPromptStyle.Render(label+": ") + m.input.View() +
 			helpStyle.Render("  ⏎ save · esc cancel")
 	}
+	if m.tagging {
+		label := "tags"
+		if haveSel {
+			label = "tags " + sel.Ref()
+		}
+		return editPromptStyle.Render(label+": ") + m.input.View() +
+			helpStyle.Render("  comma-separated · ⏎ save · esc cancel")
+	}
+	if m.filtering {
+		return editPromptStyle.Render("filter by tag: ") + m.input.View() +
+			helpStyle.Render("  comma-separated (AND) · ⏎ apply · esc cancel")
+	}
 	if m.branching {
 		label := "branch"
-		if m.cursor >= 0 && m.cursor < len(m.stashes) {
-			label = "branch " + m.stashes[m.cursor].Ref() + " →"
+		if haveSel {
+			label = "branch " + sel.Ref() + " →"
 		}
 		return editPromptStyle.Render(label+": ") + m.input.View() +
 			helpStyle.Render("  ⏎ create · esc cancel")
 	}
 	if m.confirming {
 		ref := ""
-		if m.cursor >= 0 && m.cursor < len(m.stashes) {
-			ref = " " + m.stashes[m.cursor].Ref()
+		if haveSel {
+			ref = " " + sel.Ref()
 		}
 		return confirmStyle.Render(fmt.Sprintf("%s%s? %s — (y/N)",
 			capitalize(m.pending.imperative()), ref, m.pending.consequence()))
@@ -905,20 +1246,32 @@ func (m Model) footer() string {
 	if m.notice != "" {
 		return helpStyle.Render(m.notice)
 	}
-	return helpStyle.Render("↑/↓ select · l label · b branch · a apply · p pop · d drop · ⏎/space scroll · q quit")
+	filterHint := "/ filter"
+	if len(m.filterTags) > 0 {
+		filterHint = "/ filter*"
+	}
+	return helpStyle.Render("↑/↓ select · l label · t tags · " + filterHint + " · b branch · a apply · p pop · d drop · q quit")
 }
 
-// renderList draws the stash rows, highlighting the cursor row.
+// renderList draws the visible (filtered) stash rows, highlighting the cursor
+// row. When a filter matches nothing it renders a short empty-state line.
 func (m Model) renderList() string {
+	v := m.visible()
+	if len(v) == 0 {
+		if len(m.filterTags) > 0 {
+			return dimStyle.Render("(no stashes match #" + strings.Join(m.filterTags, " #") + ")")
+		}
+		return dimStyle.Render("(no stashes)")
+	}
 	var b strings.Builder
-	for i, s := range m.stashes {
+	for i, s := range v {
 		line := m.formatRow(s)
 		if i == m.cursor {
 			b.WriteString(selectedItemStyle.Render(line))
 		} else {
 			b.WriteString(itemStyle.Render(line))
 		}
-		if i < len(m.stashes)-1 {
+		if i < len(v)-1 {
 			b.WriteByte('\n')
 		}
 	}

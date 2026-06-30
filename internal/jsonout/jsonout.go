@@ -33,13 +33,16 @@ type Diffstat struct {
 // auto-derived "<area>: <hint>", else the subject) and LabelSource says which
 // of those it is ("user"/"auto"/"subject"); AutoLabel is always the derived
 // guess (when one can be built) regardless of whether a user label overrides it,
-// so scripts can surface or apply it.
+// so scripts can surface or apply it. Tags is the stash's sidecar classifiers
+// (issue #21), always present (an empty array when none) so consumers can index
+// it without a nil check, and `--tag` filtering applies to this output too.
 type Stash struct {
 	Index       int       `json:"index"`
 	Ref         string    `json:"ref"`
 	SHA         string    `json:"sha"`
 	Label       string    `json:"label,omitempty"`
 	AutoLabel   string    `json:"auto_label,omitempty"`
+	Tags        []string  `json:"tags"`
 	Display     string    `json:"display"`
 	LabelSource string    `json:"label_source"`
 	Subject     string    `json:"subject"`
@@ -91,6 +94,7 @@ func Write(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) err
 			SHA:         s.SHA,
 			Label:       s.Label,
 			AutoLabel:   s.AutoLabel(),
+			Tags:        jsonTags(s.Tags),
 			Display:     display,
 			LabelSource: srcKind.String(),
 			Subject:     s.Subject,
@@ -113,4 +117,16 @@ func Write(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) err
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
+}
+
+// jsonTags returns tags as a non-nil slice so the JSON renders "[]" rather than
+// "null" for a stash with no tags, keeping the wire shape stable for scripts
+// that index `.tags[]` unconditionally.
+func jsonTags(tags []string) []string {
+	if len(tags) == 0 {
+		return []string{}
+	}
+	out := make([]string, len(tags))
+	copy(out, tags)
+	return out
 }
