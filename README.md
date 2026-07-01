@@ -10,10 +10,11 @@ gently nags you to revive or bury the stashes rotting at the bottom.
 ```
 ┌ stash-stash ──────────────────────── 3 stashes gathering dust 🧹 ┐
 │ > [payments] fix retry backoff      2h    main      +12 -3  2f   │
+│   #hotfix #wip                                                    │
 │   [wip] half-done modal             5d    feature/x +88 -1  4f   │
 │   experiment: swap json lib         23d   main      +4  -4  1f   │
 └──────────────────────────────────────────────────────────────────┘
-  ↑/↓ move · enter preview · a apply · p pop · d drop · b branch · l label · q quit
+  ↑/↓ move · a apply · p pop · d drop · b branch · l label · t tags · / filter · q quit
 ```
 
 ## Why
@@ -66,7 +67,10 @@ go build -o stash-stash ./cmd/stash-stash
 > `d` drops the selected stash — pop and drop ask for a `y/N` confirm first, and
 > the sidecar is kept in sync on every mutation. **`b` promotes a stash to a
 > branch** (`git stash branch`) using a slugified version of its label as the
-> suggested branch name. `stash-stash push -m "label"`
+> suggested branch name. **`t` tags the selected stash** (`wip`, `experiment`,
+> `hotfix`…) and **`/` (or `f`) live-filters** the list to stashes carrying all
+> the tags you type; on the CLI, `--tag <name>` (repeatable, AND) narrows both
+> the plain table and `--json`. `stash-stash push -m "label"`
 > stashes your working tree and records the label immediately. Stashes older
 > than `--stale-days` (default 14) are **flagged as "gathering dust"** with a
 > header banner and colored ages. Piped or non-TTY output (and `--no-tui`)
@@ -83,6 +87,8 @@ stash-stash search retry     # grep every stash's contents at once
 stash-stash search --regex 'retry.*=.*[0-9]'  # regex search (case-insensitive)
 stash-stash doctor           # find & restore lost stashes; clean orphaned labels
 stash-stash doctor --dry-run # just report what's recoverable (no prompts)
+stash-stash --tag wip        # only stashes tagged #wip (table or --json)
+stash-stash --tag wip --tag hotfix  # AND: stashes carrying *both* tags
 stash-stash --stale-days 7   # flag anything older than a week as dusty
 stash-stash --stale-days 0   # disable the staleness nag entirely
 stash-stash --json | jq .    # machine-readable list for scripting
@@ -99,7 +105,8 @@ Run `stash-stash` inside a repo with stashes and you get a two-pane browser:
   lightly colorized and scrollable.
 
 Keys: `↑`/`↓` (or `j`/`k`) to select · `g`/`G` jump to top/bottom · **`l` to
-(re)label** the selected stash (`⏎` saves, `esc` cancels) · **`a` apply ·
+(re)label** the selected stash (`⏎` saves, `esc` cancels) · **`t` to edit tags**
+(comma-separated; `⏎` saves) · **`/` or `f` to filter** by tag · **`a` apply ·
 `p` pop · `d` drop** the selected stash · **`b` branch** (promote it to a new
 branch) · `⏎`/`space`/`PgDn` and `PgUp` to scroll the diff · `q` / `Ctrl-C` /
 `Esc` to quit. The layout is resize-aware.
@@ -127,6 +134,34 @@ spurious conflicts you'd hit applying onto an unrelated `HEAD`. On success the
 stash is consumed, so — just like pop/drop — the list resyncs and the sidecar
 entry is pruned. If the apply conflicts or the branch name already exists, git's
 message is surfaced in a toast and the stash is left untouched.
+
+### Tag & filter your stashes
+
+Labels name a stash; **tags classify** it. Press **`t`** on the selected stash
+to open a one-line editor and type a comma-separated list — `wip, experiment,
+hotfix`. Tags are slugified (lower-cased, spaces/punctuation → `-`), de-duped,
+and sorted, then persisted to the sidecar **keyed by content SHA**, so they ride
+along through `pop`/`push` reshuffles just like labels. They render inline under
+each row as compact `#tag` tokens (and in the plain table too).
+
+Once you've got more than a handful of stashes, **filter** down to what you care
+about. In the TUI press **`/`** (or **`f`**), type one or more tags, and the
+list narrows to stashes carrying **all** of them (AND); the active filter shows
+in the title bar. Submit an empty filter to clear it. Editing a stash's tags
+re-evaluates the filter live, so retagging something out of the current view
+drops it immediately.
+
+For scripting, the same filter is a flag:
+
+```bash
+stash-stash --tag wip               # plain table, only #wip stashes
+stash-stash --tag wip --tag hotfix  # AND: must carry both tags
+stash-stash --json --tag experiment | jq '.stashes[].sha'
+```
+
+`--tag` is repeatable and applies to both the plain table and `--json`. Every
+`--json` stash object carries a `tags` array (an empty `[]` when untagged), so
+consumers can filter or group without a nil check.
 
 ### Stashing with a label that sticks
 

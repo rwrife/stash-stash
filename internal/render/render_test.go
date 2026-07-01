@@ -227,3 +227,33 @@ func TestSearchResultsNoHits(t *testing.T) {
 		t.Errorf("missing no-match line:\n%s", buf.String())
 	}
 }
+
+func TestFormatTags(t *testing.T) {
+	if got := FormatTags(nil); got != "" {
+		t.Errorf("FormatTags(nil) = %q, want empty", got)
+	}
+	if got := FormatTags([]string{"wip", "hotfix"}); got != "#wip #hotfix" {
+		t.Errorf("FormatTags = %q, want %q", got, "#wip #hotfix")
+	}
+	if got := FormatTags([]string{"wip", "", "x"}); got != "#wip #x" {
+		t.Errorf("FormatTags skips blanks: got %q", got)
+	}
+}
+
+func TestTableShowsTags(t *testing.T) {
+	now := time.Date(2026, 6, 17, 12, 0, 0, 0, time.UTC)
+	stashes := []model.Stash{
+		{Index: 0, SHA: "deadbeef", Subject: "WIP on main: fix retry", Branch: "main",
+			Created: now.Add(-2 * time.Hour), Label: "retry fix", Tags: []string{"hotfix", "wip"}},
+	}
+	var buf bytes.Buffer
+	if err := Table(&buf, stashes, now, 14); err != nil {
+		t.Fatalf("Table() error = %v", err)
+	}
+	out := buf.String()
+	for _, want := range []string{"retry fix", "#hotfix", "#wip"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("table missing %q\n---\n%s", want, out)
+		}
+	}
+}

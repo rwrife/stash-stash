@@ -22,8 +22,10 @@ import (
 // them). staleDays drives the "gathering dust" banner and per-row staleness
 // coloring (0 disables). The out/in writers/readers let tests and non-default
 // terminals be wired explicitly; pass os.Stdout / os.Stdin for normal use.
-func Run(stashes []model.Stash, show ShowFunc, store labeler, actions Actions, now time.Time, staleDays int, in io.Reader, out io.Writer) error {
-	m := New(stashes, show, store, actions, now, staleDays)
+// initialFilter (normalized tags) pre-seeds the live tag filter so a `--tag`
+// invocation opens the browser already narrowed; pass nil for no filter.
+func Run(stashes []model.Stash, show ShowFunc, store labeler, actions Actions, now time.Time, staleDays int, initialFilter []string, in io.Reader, out io.Writer) error {
+	m := New(stashes, show, store, actions, now, staleDays, initialFilter)
 	p := tea.NewProgram(m, tea.WithInput(in), tea.WithOutput(out), tea.WithAltScreen())
 	_, err := p.Run()
 	return err

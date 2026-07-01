@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"text/tabwriter"
 	"time"
 	"unicode/utf8"
@@ -54,7 +55,8 @@ func Banner(stashes []model.Stash, now time.Time, staleDays int) string {
 // dusty) and flags stale rows with a trailing "*" on the age token.
 // Columns: AGE | INDEX | LABEL | BRANCH | CHANGES. LABEL is the sidecar label
 // when set, otherwise an auto-derived "<area>: <hint>" (flagged with a trailing
-// "~" since plain text can't italicize it), otherwise the raw git subject.
+// "~" since plain text can't italicize it), otherwise the raw git subject; any
+// sidecar tags are appended to the LABEL cell as compact "#tag" tokens.
 func Table(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) error {
 	banner := Banner(stashes, now, staleDays)
 	if banner != "" {
@@ -92,6 +94,11 @@ func Table(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) err
 		if src == model.LabelAuto {
 			sawAuto = true
 			label += " ~"
+		}
+		// Append compact #tag tokens after the label so a row's classifiers are
+		// visible in plain text too (and skimmable next to the name).
+		if tags := FormatTags(s.Tags); tags != "" {
+			label += "  " + tags
 		}
 		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
 			ageTok,
@@ -192,6 +199,24 @@ func SearchResults(w io.Writer, hits []SearchHit, term string, now time.Time) (i
 		}
 	}
 	return total, nil
+}
+
+// FormatTags renders a stash's tags as compact, skimmable "#tag" tokens joined
+// by spaces (e.g. "#hotfix #wip"), or "" when there are none. It is shared by
+// the plain table and any caller that wants the same inline tag styling without
+// color (the TUI styles its own with Lip Gloss).
+func FormatTags(tags []string) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(tags))
+	for _, t := range tags {
+		if t == "" {
+			continue
+		}
+		parts = append(parts, "#"+t)
+	}
+	return strings.Join(parts, " ")
 }
 
 // plural picks the singular or plural noun for n (kept local so this package

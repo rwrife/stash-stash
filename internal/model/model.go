@@ -96,6 +96,11 @@ type Stash struct {
 	// auto-derived label (see AutoLabel) and then the raw Subject for display.
 	Label string
 
+	// Tags are the stash's sidecar classifiers (issue #21), matched by SHA and
+	// kept sorted/de-duplicated by internal/meta. Empty when the stash has no
+	// tags. They drive `--tag` filtering and render inline in the list.
+	Tags []string
+
 	// TopFile is the stash's most significant changed file path, used to derive
 	// an auto-label when no explicit Label exists (issue #7). It is populated by
 	// git.EnrichDiffstats alongside Diffstat (same `git stash show --numstat`
@@ -183,6 +188,27 @@ func (s Stash) BranchSuggestion() string {
 // Ref returns the canonical git reference for the stash, e.g. "stash@{0}".
 func (s Stash) Ref() string {
 	return "stash@{" + itoa(s.Index) + "}"
+}
+
+// HasAllTags reports whether the stash carries every tag in want (AND
+// semantics). want is matched against the stash's already-normalized Tags;
+// callers that take raw user input should slugify it first (see meta.SlugTag)
+// so the comparison is apples-to-apples. An empty want matches every stash, so
+// "no --tag given" is naturally "no filter".
+func (s Stash) HasAllTags(want []string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	have := make(map[string]struct{}, len(s.Tags))
+	for _, t := range s.Tags {
+		have[t] = struct{}{}
+	}
+	for _, w := range want {
+		if _, ok := have[w]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // itoa is a tiny dependency-free integer formatter for small, non-negative

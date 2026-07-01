@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -57,6 +58,15 @@ func TestRunHelpListsM6Flags(t *testing.T) {
 		if !strings.Contains(help, want) {
 			t.Errorf("help missing flag %q:\n%s", want, help)
 		}
+	}
+}
+
+func TestRunHelpListsTagFlag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	run([]string{"-h"}, &stdout, &stderr)
+	help := stderr.String()
+	if !strings.Contains(help, "-tag") {
+		t.Errorf("help missing -tag flag:\n%s", help)
 	}
 }
 
@@ -678,5 +688,101 @@ func seedSidecar(t *testing.T, dir string, labels map[string]string) {
 	}
 	if err := s.Save(); err != nil {
 		t.Fatalf("seed save: %v", err)
+	}
+}
+
+// writeSidecar writes a sidecar JSON with the given SHA->tags into the temp
+// repo's git dir so --tag filtering has metadata to read.
+func writeSidecarTags(t *testing.T, dir string, tagsBySHA map[string][]string) {
+	t.Helper()
+	type entry struct {
+		Tags []string `json:"tags,omitempty"`
+	}
+	payload := struct {
+		Version int              `json:"version"`
+		Entries map[string]entry `json:"entries"`
+	}{Version: 1, Entries: map[string]entry{}}
+	for sha, tags := range tagsBySHA {
+		payload.Entries[sha] = entry{Tags: tags}
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal sidecar: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".git", "stash-stash.json"), data, 0o644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+}
+
+func TestTagFilterNarrowsTable(t *testing.T) {
+	stubList(t, []model.Stash{
+		{Index: 0, SHA: "aaa", Subject: "WIP on main: alpha", Branch: "main"},
+		{Index: 1, SHA: "bbb", Subject: "On feature/x: beta", Branch: "feature/x"},
+		{Index: 2, SHA: "ccc", Subject: "WIP on main: gamma", Branch: "main"},
+	}, nil)
+	dir := tempRepoSidecar(t)
+	writeSidecarTags(t, dir, map[string][]string{
+		"aaa": {"wip"},
+		"ccc": {"wip", "hotfix"},
+	})
+
+	// --tag wip → aaa and ccc, not bbb.
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--no-tui", "--tag", "wip"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "stash@{0}") || !strings.Contains(out, "stash@{2}") {
+		t.Errorf("--tag wip should include aaa+ccc rows:\n%s", out)
+	}
+	if strings.Contains(out, "stash@{1}") {
+		t.Errorf("--tag wip should exclude bbb row:\n%s", out)
+	}
+	if !strings.Contains(out, "#wip") {
+		t.Errorf("table should show #wip tag token:\n%s", out)
+	}
+
+	// --tag wip --tag hotfix (AND) → only ccc.
+	stdout.Reset()
+	stderr.Reset()
+	if code := run([]string{"--no-tui", "--tag", "wip", "--tag", "hotfix"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	out = stdout.String()
+	if !strings.Contains(out, "stash@{2}") {
+		t.Errorf("AND filter should include ccc:\n%s", out)
+	}
+	if strings.Contains(out, "stash@{0}") || strings.Contains(out, "stash@{1}") {
+		t.Errorf("AND filter should exclude aaa+bbb:\n%s", out)
+	}
+}
+
+func TestTagFilterAppliesToJSON(t *testing.T) {
+	stubList(t, []model.Stash{
+		{Index: 0, SHA: "aaa", Subject: "WIP on main: alpha", Branch: "main"},
+		{Index: 1, SHA: "bbb", Subject: "On feature/x: beta", Branch: "feature/x"},
+	}, nil)
+	dir := tempRepoSidecar(t)
+	writeSidecarTags(t, dir, map[string][]string{"aaa": {"wip"}})
+
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"--json", "--tag", "wip"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("exit = %d, want 0; stderr=%q", code, stderr.String())
+	}
+	var got struct {
+		Count   int `json:"count"`
+		Stashes []struct {
+			SHA  string   `json:"sha"`
+			Tags []string `json:"tags"`
+		} `json:"stashes"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v\n%s", err, stdout.String())
+	}
+	if got.Count != 1 || len(got.Stashes) != 1 || got.Stashes[0].SHA != "aaa" {
+		t.Errorf("--json --tag wip = %+v, want only aaa", got)
+	}
+	if len(got.Stashes[0].Tags) != 1 || got.Stashes[0].Tags[0] != "wip" {
+		t.Errorf("json row tags = %v, want [wip]", got.Stashes[0].Tags)
 	}
 }

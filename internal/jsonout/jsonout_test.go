@@ -151,3 +151,42 @@ func TestWriteEmpty(t *testing.T) {
 		t.Errorf("empty stashes should render as [], got:\n%s", buf.String())
 	}
 }
+
+func TestWriteIncludesTags(t *testing.T) {
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	stashes := []model.Stash{
+		{Index: 0, SHA: "deadbeef", Subject: "WIP on main: x", Branch: "main",
+			Created: now.Add(-time.Hour), Tags: []string{"hotfix", "wip"}},
+		{Index: 1, SHA: "cafebabe", Subject: "WIP on main: y", Branch: "main",
+			Created: now.Add(-time.Hour)}, // no tags
+	}
+
+	var buf bytes.Buffer
+	if err := Write(&buf, stashes, now, 14); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	// Raw JSON must always carry a "tags" array, even when empty, so scripts can
+	// index .tags[] unconditionally.
+	if !bytes.Contains(buf.Bytes(), []byte(`"tags"`)) {
+		t.Errorf("json output missing tags field\n%s", buf.String())
+	}
+	if !bytes.Contains(buf.Bytes(), []byte(`"tags": []`)) {
+		t.Errorf("tagless stash should render tags as [], got:\n%s", buf.String())
+	}
+
+	var got Output
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if want := []string{"hotfix", "wip"}; len(got.Stashes[0].Tags) != 2 ||
+		got.Stashes[0].Tags[0] != want[0] || got.Stashes[0].Tags[1] != want[1] {
+		t.Errorf("row0 tags = %v, want %v", got.Stashes[0].Tags, want)
+	}
+	if got.Stashes[1].Tags == nil {
+		t.Error("row1 tags decoded to nil; want empty non-nil slice")
+	}
+	if len(got.Stashes[1].Tags) != 0 {
+		t.Errorf("row1 tags = %v, want empty", got.Stashes[1].Tags)
+	}
+}

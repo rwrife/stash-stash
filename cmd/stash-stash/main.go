@@ -37,6 +37,18 @@ import (
 //	go build -ldflags "-X main.version=v0.1.0" ./cmd/stash-stash
 var version = "dev"
 
+// stringSlice is a flag.Value that accumulates a repeatable string flag, so
+// `--tag wip --tag hotfix` collects both values (AND-filtered downstream). Each
+// Set appends; the zero value is an empty slice.
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ",") }
+
+func (s *stringSlice) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 // now is indirected so tests can pin the clock when checking age output.
 var now = time.Now
 
@@ -112,6 +124,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&noTUIFlag, "no-tui", false, "force plain table output even on a TTY")
 	staleDays := fs.Int("stale-days", defaultStaleDays, "flag stashes older than this many days as gathering dust (0 disables)")
 	jsonOut := fs.Bool("json", false, "print the stash list as JSON for scripting (implies --no-tui)")
+	var tagFilter stringSlice
+	fs.Var(&tagFilter, "tag", "only show stashes carrying this tag; repeatable for AND (e.g. --tag wip --tag hotfix)")
 
 	if err := fs.Parse(args); err != nil {
 		// flag already printed the error + usage; -h/--help returns ErrHelp.
@@ -131,20 +145,26 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
-	return listOrBrowse(stdout, stderr, *staleDays, *jsonOut)
+	return listOrBrowse(stdout, stderr, *staleDays, *jsonOut, tagFilter)
 }
 
 // listOrBrowse loads the current repo's stashes, enriches them with sidecar
-// labels (matched by content SHA) and diffstats, and either emits JSON
+// labels (matched by content SHA), tags, and diffstats, and either emits JSON
 // (--json), opens the interactive TUI (TTY stdout, not --no-tui/--json), or
 // prints the plain table. staleDays drives the "gathering dust" nag and the
-// stale highlighting/markers (0 disables). It returns the process exit code: 0
+// stale highlighting/markers (0 disables). tagFilter (repeatable --tag) narrows
+// the plain table and JSON to stashes carrying *all* the given tags (AND) and
+// pre-seeds the TUI's live tag filter. It returns the process exit code: 0
 // on success (including the no-stash case), 1 on a real error talking to git,
 // 1 on a TUI runtime failure.
-func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool) int {
+func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool, tagFilter []string) int {
 	ctx := context.Background()
 
-	stashes, err := git.List(ctx)
+	// Normalize the requested tags once so filtering matches the slugified form
+	// stored on each stash ("Hot Fix" --tag and a "hot-fix" stored tag agree).
+	wantTags := meta.NormalizeTags(tagFilter)
+
+	stashes, err := gitList(ctx)
 	if err != nil {
 		if errors.Is(err, git.ErrNotARepo) {
 			fmt.Fprintln(stderr, "stash-stash: not a git repository (run me inside one).")
@@ -170,11 +190,20 @@ func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool) int {
 		return 0
 	}
 
-	// Enrich with sidecar labels + diffstats. Metadata is best-effort: a
+	// Enrich with sidecar labels + tags + diffstats. Metadata is best-effort: a
 	// sidecar problem must never stop us listing stashes, so a load error is
 	// reported to stderr but we continue label-less.
 	store := loadAndApplyMeta(ctx, stashes, stderr)
 	git.EnrichDiffstats(ctx, stashes)
+
+	// Apply the --tag filter (AND across tags). Filtering happens after
+	// enrichment so each stash's Tags are populated; the TUI path filters
+	// interactively instead (it is seeded with wantTags below), so we only
+	// narrow the slice here for the non-interactive table/JSON outputs.
+	interactive := !noTUIFlag && !jsonOut && stdout == os.Stdout && stdoutIsTTY()
+	if len(wantTags) > 0 && !interactive {
+		stashes = filterByTags(stashes, wantTags)
+	}
 
 	// JSON output is for scripting: deterministic, never interactive, and
 	// independent of TTY detection.
@@ -188,7 +217,7 @@ func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool) int {
 
 	// Interactive path: only when we have a real terminal and the user didn't
 	// opt out. Everything else (pipes, CI, --no-tui) gets the plain table.
-	if !noTUIFlag && stdout == os.Stdout && stdoutIsTTY() {
+	if interactive {
 		// Wire the mutating actions. Reload re-lists and re-enriches so the TUI
 		// can resync after a pop/drop (indices shift). It is best-effort: a
 		// reload error is surfaced in-TUI, not fatal.
@@ -198,7 +227,7 @@ func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool) int {
 			Drop:   git.Drop,
 			Branch: git.Branch,
 			Reload: func(ctx context.Context) ([]model.Stash, error) {
-				fresh, err := git.List(ctx)
+				fresh, err := gitList(ctx)
 				if err != nil {
 					return nil, err
 				}
@@ -207,13 +236,16 @@ func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool) int {
 						if label, ok := store.Label(fresh[i].SHA); ok {
 							fresh[i].Label = label
 						}
+						if tags := store.Tags(fresh[i].SHA); len(tags) > 0 {
+							fresh[i].Tags = tags
+						}
 					}
 				}
 				git.EnrichDiffstats(ctx, fresh)
 				return fresh, nil
 			},
 		}
-		if err := tui.Run(stashes, git.Show, store, actions, now(), staleDays, os.Stdin, os.Stdout); err != nil {
+		if err := tui.Run(stashes, git.Show, store, actions, now(), staleDays, wantTags, os.Stdin, os.Stdout); err != nil {
 			fmt.Fprintf(stderr, "stash-stash: tui: %v\n", err)
 			return 1
 		}
@@ -247,6 +279,9 @@ func loadAndApplyMeta(ctx context.Context, stashes []model.Stash, stderr io.Writ
 		if label, ok := store.Label(stashes[i].SHA); ok {
 			stashes[i].Label = label
 		}
+		if tags := store.Tags(stashes[i].SHA); len(tags) > 0 {
+			stashes[i].Tags = tags
+		}
 	}
 
 	// Garbage-collect labels for stashes dropped/popped outside stash-stash.
@@ -257,6 +292,23 @@ func loadAndApplyMeta(ctx context.Context, stashes []model.Stash, stderr io.Writ
 		}
 	}
 	return store
+}
+
+// filterByTags returns the subset of stashes carrying every tag in wantTags
+// (AND semantics). wantTags must already be normalized (slugified). An empty
+// wantTags returns the input unchanged. The result preserves stash order and
+// never shares backing storage that would surprise the caller.
+func filterByTags(stashes []model.Stash, wantTags []string) []model.Stash {
+	if len(wantTags) == 0 {
+		return stashes
+	}
+	out := make([]model.Stash, 0, len(stashes))
+	for i := range stashes {
+		if stashes[i].HasAllTags(wantTags) {
+			out = append(out, stashes[i])
+		}
+	}
+	return out
 }
 
 // runPush implements `stash-stash push [-m "label"]`: a thin wrapper around

@@ -144,3 +144,22 @@ func TestBranchSuggestion(t *testing.T) {
 		}
 	}
 }
+
+func TestHasAllTags(t *testing.T) {
+	s := Stash{Tags: []string{"wip", "hotfix"}}
+	if !s.HasAllTags(nil) {
+		t.Error("empty want should match every stash")
+	}
+	if !s.HasAllTags([]string{"wip"}) {
+		t.Error("single present tag should match")
+	}
+	if !s.HasAllTags([]string{"hotfix", "wip"}) {
+		t.Error("AND of present tags should match")
+	}
+	if s.HasAllTags([]string{"wip", "review"}) {
+		t.Error("AND with an absent tag should not match")
+	}
+	if (Stash{}).HasAllTags([]string{"wip"}) {
+		t.Error("a tagless stash should not match a non-empty filter")
+	}
+}

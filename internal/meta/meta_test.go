@@ -215,3 +215,150 @@ func TestRemoveDeletesEntry(t *testing.T) {
 		t.Error("Remove of an empty SHA returned true")
 	}
 }
+
+// --- issue #21: tags & filtering ---
+
+func TestSlugTag(t *testing.T) {
+	cases := map[string]string{
+		"WIP":            "wip",
+		"  experiment  ": "experiment",
+		"Hot Fix!":       "hot-fix",
+		"feature/login":  "feature-login",
+		"a___b...c":      "a-b-c",
+		"---":            "",
+		"":               "",
+		"Café":           "caf", // non-ASCII dropped, trailing hyphen trimmed
+		"  ":             "",
+		"v2.0":           "v2-0",
+	}
+	for in, want := range cases {
+		if got := SlugTag(in); got != want {
+			t.Errorf("SlugTag(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSetTagsNormalizesAndRoundTrips(t *testing.T) {
+	s := tempStore(t)
+	// Mixed case, dupes, junk, and an order that must come back sorted.
+	s.SetTags("sha-1", []string{"WIP", "experiment", "wip", "Hot Fix", "  ", "---"})
+	got := s.Tags("sha-1")
+	want := []string{"experiment", "hot-fix", "wip"}
+	if !equalStrings(got, want) {
+		t.Fatalf("Tags after SetTags = %v, want %v", got, want)
+	}
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	reloaded, err := loadFrom(s.Path())
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := reloaded.Tags("sha-1"); !equalStrings(got, want) {
+		t.Errorf("Tags after reload = %v, want %v", got, want)
+	}
+}
+
+func TestTagsReturnedCopyIsIndependent(t *testing.T) {
+	s := tempStore(t)
+	s.SetTags("sha-1", []string{"wip", "hotfix"})
+	got := s.Tags("sha-1")
+	got[0] = "mutated"
+	if again := s.Tags("sha-1"); again[0] == "mutated" {
+		t.Error("Tags returned a slice aliasing internal storage")
+	}
+}
+
+func TestAddTagsUnions(t *testing.T) {
+	s := tempStore(t)
+	s.SetTags("sha-1", []string{"wip"})
+	s.AddTags("sha-1", []string{"hotfix", "wip", "Review"})
+	got := s.Tags("sha-1")
+	want := []string{"hotfix", "review", "wip"}
+	if !equalStrings(got, want) {
+		t.Errorf("Tags after AddTags = %v, want %v", got, want)
+	}
+	// Adding only junk is a no-op and must not create an entry.
+	s2 := tempStore(t)
+	s2.AddTags("sha-x", []string{"---", "  "})
+	if len(s2.Entries) != 0 {
+		t.Errorf("AddTags of only-junk created %d entries, want 0", len(s2.Entries))
+	}
+}
+
+func TestRemoveTag(t *testing.T) {
+	s := tempStore(t)
+	s.SetTags("sha-1", []string{"wip", "hotfix", "review"})
+	if !s.RemoveTag("sha-1", "HotFix") { // slugifies to hotfix
+		t.Error("RemoveTag(hotfix) returned false")
+	}
+	if got, want := s.Tags("sha-1"), []string{"review", "wip"}; !equalStrings(got, want) {
+		t.Errorf("Tags after RemoveTag = %v, want %v", got, want)
+	}
+	if s.RemoveTag("sha-1", "nope") {
+		t.Error("RemoveTag of an absent tag returned true")
+	}
+	// Removing the last tags clears the entry entirely (no other metadata).
+	s.RemoveTag("sha-1", "review")
+	s.RemoveTag("sha-1", "wip")
+	if _, ok := s.Entries["sha-1"]; ok {
+		t.Error("entry survived removing its last tag with no other metadata")
+	}
+}
+
+func TestSetTagsEmptyClearsButKeepsLabel(t *testing.T) {
+	s := tempStore(t)
+	s.SetLabel("sha-1", "keep me")
+	s.SetTags("sha-1", []string{"wip"})
+	s.SetTags("sha-1", nil) // clear tags only
+	if got := s.Tags("sha-1"); got != nil {
+		t.Errorf("Tags after clear = %v, want nil", got)
+	}
+	if lbl, ok := s.Label("sha-1"); !ok || lbl != "keep me" {
+		t.Errorf("label lost when clearing tags: %q ok=%v", lbl, ok)
+	}
+}
+
+func TestHasAllTags(t *testing.T) {
+	s := tempStore(t)
+	s.SetTags("sha-1", []string{"wip", "hotfix"})
+	if !s.HasAllTags("sha-1", nil) {
+		t.Error("empty want should match (no filter)")
+	}
+	if !s.HasAllTags("sha-1", []string{"WIP"}) {
+		t.Error("single matching tag (case-insensitive) should match")
+	}
+	if !s.HasAllTags("sha-1", []string{"wip", "HotFix"}) {
+		t.Error("AND of present tags should match")
+	}
+	if s.HasAllTags("sha-1", []string{"wip", "review"}) {
+		t.Error("AND with an absent tag should not match")
+	}
+	if s.HasAllTags("missing", []string{"wip"}) {
+		t.Error("unknown SHA should not match a non-empty filter")
+	}
+}
+
+func TestSplitTags(t *testing.T) {
+	got := SplitTags(" wip, Hot Fix ,,wip , --- ")
+	want := []string{"hot-fix", "wip"}
+	if !equalStrings(got, want) {
+		t.Errorf("SplitTags = %v, want %v", got, want)
+	}
+	if SplitTags("   ") != nil {
+		t.Error("SplitTags of blank should be nil")
+	}
+}
+
+// equalStrings compares two string slices element-wise (both nil counts equal).
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
