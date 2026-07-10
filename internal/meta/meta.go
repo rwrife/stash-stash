@@ -1,7 +1,6 @@
 // Package meta manages stash-stash's sidecar metadata file,
 // `.git/stash-stash.json`. It maps a stash's *content* SHA to the
-// human-readable bits git can't store well: a label (and, in later milestones,
-// tags and notes).
+// human-readable bits git can't store well: a label, tags, and a free-form note.
 //
 // Keying by content SHA — not by the volatile stash@{N} index — is the whole
 // point: labels must survive `git stash pop`/`push` reshuffling the stack. The
@@ -46,7 +45,8 @@ type Entry struct {
 	// editor (issue #21).
 	Tags []string `json:"tags,omitempty"`
 
-	// Note is an optional multi-line "why". Reserved for a later milestone.
+	// Note is an optional multi-line "why" for the stash (issue #22), e.g.
+	// "blocked on the API change; revisit after #42".
 	Note string `json:"note,omitempty"`
 
 	// UpdatedAt records when this entry was last written, in UTC RFC3339.
@@ -286,6 +286,45 @@ func (s *Store) SetLabel(sha, label string) {
 	label = strings.TrimSpace(label)
 	e := s.Entries[sha]
 	e.Label = label
+	e.UpdatedAt = time.Now().UTC()
+	if e.Label == "" && len(e.Tags) == 0 && e.Note == "" {
+		delete(s.Entries, sha)
+		return
+	}
+	s.Entries[sha] = e
+}
+
+// Note returns the stored note for a stash content SHA and whether a non-empty
+// note exists. An empty/unknown SHA yields ("", false). The note is returned
+// verbatim (multi-line preserved); callers own any rendering/truncation.
+func (s *Store) Note(sha string) (string, bool) {
+	if s == nil || sha == "" {
+		return "", false
+	}
+	e, ok := s.Entries[sha]
+	if !ok {
+		return "", false
+	}
+	return e.Note, e.Note != ""
+}
+
+// SetNote records (or, with an empty note, clears) the free-form "why" note for
+// a stash content SHA and stamps UpdatedAt. It mutates the in-memory store
+// only; callers must Save to persist. A no-op (empty SHA) is ignored.
+//
+// The note is trimmed of surrounding whitespace but interior newlines are kept
+// so multi-line notes round-trip. Clearing the note removes the entry entirely
+// when it carries no other metadata, keeping the sidecar tidy.
+func (s *Store) SetNote(sha, note string) {
+	if s == nil || sha == "" {
+		return
+	}
+	if s.Entries == nil {
+		s.Entries = map[string]Entry{}
+	}
+	note = strings.TrimSpace(note)
+	e := s.Entries[sha]
+	e.Note = note
 	e.UpdatedAt = time.Now().UTC()
 	if e.Label == "" && len(e.Tags) == 0 && e.Note == "" {
 		delete(s.Entries, sha)

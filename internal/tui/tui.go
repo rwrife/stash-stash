@@ -82,6 +82,7 @@ type Actions struct {
 type labeler interface {
 	SetLabel(sha, label string)
 	SetTags(sha string, tags []string)
+	SetNote(sha, note string)
 	Save() error
 }
 
@@ -139,6 +140,13 @@ var (
 
 	// statStyle dims the diffstat token in the list.
 	statStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("108"))
+
+	// noteIndicatorStyle tints the 📝 marker shown in a list row when the stash
+	// carries a note (issue #22).
+	noteIndicatorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("180"))
+
+	// noteBlockStyle frames the stash's note at the top of the preview pane.
+	noteBlockStyle = lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("180"))
 
 	// editPromptStyle frames the inline label editor row.
 	editPromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Padding(0, 1)
@@ -297,6 +305,10 @@ type Model struct {
 	// relabel, so it is tracked separately and is mutually exclusive with the
 	// other inline editors.
 	tagging bool
+	// noting is true while the inline note editor is open (issue #22). It shares
+	// the `input` field but commits a free-form note to the sidecar. Mutually
+	// exclusive with the other inline editors.
+	noting bool
 	// filtering is true while the inline live-filter prompt is open; filterTags
 	// holds the currently-applied (normalized) tag filter. When non-empty, only
 	// stashes carrying all of filterTags are shown. cursor/preview operate on the
@@ -464,6 +476,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.tagging {
 		return m.handleTagKey(msg)
 	}
+	if m.noting {
+		return m.handleNoteKey(msg)
+	}
 	if m.filtering {
 		return m.handleFilterKey(msg)
 	}
@@ -499,6 +514,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.beginEdit()
 	case "t":
 		return m.beginTag()
+	case "n":
+		return m.beginNote()
 	case "b":
 		return m.beginBranch()
 	case "/", "f":
@@ -596,6 +613,84 @@ func (m Model) commitEdit() (tea.Model, tea.Cmd) {
 		m.notice = "label cleared"
 	} else {
 		m.notice = "label saved"
+	}
+	return m, nil
+}
+
+// beginNote opens the inline note editor for the selected (visible) stash,
+// seeding it with the current note (issue #22). This TUI path edits a
+// single-line note inline; for multi-line notes users can use the
+// `stash-stash note <ref>` CLI with $EDITOR. It is a no-op (with a toast) when
+// noting is disabled (no store) or there is no selection.
+func (m Model) beginNote() (tea.Model, tea.Cmd) {
+	sel, ok := m.selected()
+	if m.store == nil || !ok {
+		if m.store == nil {
+			m.notice = "notes unavailable (no sidecar)"
+		}
+		return m, nil
+	}
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.CharLimit = 500
+	ti.Placeholder = "blocked on the API change; revisit after #42"
+	// Seed with the existing note; collapse any newlines to spaces for the
+	// single-line field so an $EDITOR-authored multi-line note stays viewable.
+	ti.SetValue(strings.ReplaceAll(sel.Note, "\n", " "))
+	ti.CursorEnd()
+	ti.Width = m.listInnerW
+	if ti.Width < 8 {
+		ti.Width = 8
+	}
+	ti.Focus()
+	m.input = ti
+	m.noting = true
+	m.notice = ""
+	return m, textinput.Blink
+}
+
+// handleNoteKey drives the inline note editor: Enter commits, Esc cancels,
+// everything else edits the text field.
+func (m Model) handleNoteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		return m.commitNote()
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.noting = false
+		m.notice = "note edit cancelled"
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	return m, cmd
+}
+
+// commitNote persists the edited note to the sidecar (keyed by the stash's
+// content SHA) and updates the in-memory stash so the list/preview reflect it
+// immediately. Trimming to empty clears the note. Save failures surface in the
+// notice line but never crash the TUI.
+func (m Model) commitNote() (tea.Model, tea.Cmd) {
+	m.noting = false
+	sel, ok := m.selected()
+	if !ok || m.store == nil {
+		return m, nil
+	}
+	idx := m.stashIndexBySHA(sel.SHA)
+	if idx < 0 {
+		return m, nil
+	}
+	note := strings.TrimSpace(m.input.Value())
+	sha := m.stashes[idx].SHA
+	m.store.SetNote(sha, note)
+	m.stashes[idx].Note = note
+	if err := m.store.Save(); err != nil {
+		m.notice = "save failed: " + err.Error()
+		return m, nil
+	}
+	if note == "" {
+		m.notice = "note cleared"
+	} else {
+		m.notice = "note saved"
 	}
 	return m, nil
 }
@@ -1223,6 +1318,14 @@ func (m Model) footer() string {
 		return editPromptStyle.Render(label+": ") + m.input.View() +
 			helpStyle.Render("  comma-separated · ⏎ save · esc cancel")
 	}
+	if m.noting {
+		label := "note"
+		if haveSel {
+			label = "note " + sel.Ref()
+		}
+		return editPromptStyle.Render(label+": ") + m.input.View() +
+			helpStyle.Render("  ⏎ save · esc cancel")
+	}
 	if m.filtering {
 		return editPromptStyle.Render("filter by tag: ") + m.input.View() +
 			helpStyle.Render("  comma-separated (AND) · ⏎ apply · esc cancel")
@@ -1250,7 +1353,7 @@ func (m Model) footer() string {
 	if len(m.filterTags) > 0 {
 		filterHint = "/ filter*"
 	}
-	return helpStyle.Render("↑/↓ select · l label · t tags · " + filterHint + " · b branch · a apply · p pop · d drop · q quit")
+	return helpStyle.Render("↑/↓ select · l label · t tags · n note · " + filterHint + " · b branch · a apply · p pop · d drop · q quit")
 }
 
 // renderList draws the visible (filtered) stash rows, highlighting the cursor
@@ -1298,6 +1401,9 @@ func (m Model) formatRow(s model.Stash) string {
 	if stat := s.Diffstat.String(); stat != "" {
 		head += "  " + statStyle.Render(stat)
 	}
+	if s.Note != "" {
+		head += "  " + noteIndicatorStyle.Render("\U0001F4DD")
+	}
 
 	// Second line: the human label if present (highlighted), an auto-derived
 	// label (dim + italic, so it reads as a guess), else the raw git subject.
@@ -1337,10 +1443,18 @@ func (m Model) renderDiff() string {
 	if m.loadedFor == m.cursor {
 		loaded = m.currentDiff
 	}
-	if strings.TrimSpace(loaded) == "" {
-		return dimStyle.Render("(empty diff — nothing to preview)")
+	// Surface the stash's note (issue #22) at the top of the preview so the
+	// "why" is visible right beside the "what".
+	notePrefix := ""
+	if m.cursor >= 0 && m.cursor < len(m.stashes) {
+		if n := strings.TrimSpace(m.stashes[m.cursor].Note); n != "" {
+			notePrefix = noteBlockStyle.Render("\U0001F4DD "+n) + "\n\n"
+		}
 	}
-	return colorizeDiff(loaded)
+	if strings.TrimSpace(loaded) == "" {
+		return notePrefix + dimStyle.Render("(empty diff — nothing to preview)")
+	}
+	return notePrefix + colorizeDiff(loaded)
 }
 
 // dustBanner returns the short "gathering dust" nag for the title row, or ""

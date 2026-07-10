@@ -36,16 +36,18 @@ func stubShow(ctx context.Context, ref string) (string, error) {
 type fakeStore struct {
 	labels  map[string]string
 	tags    map[string][]string
+	notes   map[string]string
 	saves   int
 	saveErr error
 	prunes  int // number of entries removed across Prune calls
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{labels: map[string]string{}, tags: map[string][]string{}}
+	return &fakeStore{labels: map[string]string{}, tags: map[string][]string{}, notes: map[string]string{}}
 }
 
 func (f *fakeStore) SetLabel(sha, label string) { f.labels[sha] = label }
+func (f *fakeStore) SetNote(sha, note string)   { f.notes[sha] = note }
 func (f *fakeStore) SetTags(sha string, tags []string) {
 	if len(tags) == 0 {
 		delete(f.tags, sha)
