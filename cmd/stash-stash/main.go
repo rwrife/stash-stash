@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -112,12 +113,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "doctor" {
 		return runDoctor(args[1:], os.Stdin, stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "note" {
+		return runNote(args[1:], os.Stdin, stdout, stderr)
+	}
 
 	fs := flag.NewFlagSet("stash-stash", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "stash-stash %s — a concierge for your git stash graveyard.\n\n", version)
-		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n  stash-stash doctor [--dry-run]\n\nFlags:\n")
+		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n  stash-stash note <stash-ref> [-m \"text\"]\n  stash-stash doctor [--dry-run]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	showVersion := fs.Bool("version", false, "print version and exit")
@@ -239,6 +243,9 @@ func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool, tagFilt
 						if tags := store.Tags(fresh[i].SHA); len(tags) > 0 {
 							fresh[i].Tags = tags
 						}
+						if note, ok := store.Note(fresh[i].SHA); ok {
+							fresh[i].Note = note
+						}
 					}
 				}
 				git.EnrichDiffstats(ctx, fresh)
@@ -281,6 +288,9 @@ func loadAndApplyMeta(ctx context.Context, stashes []model.Stash, stderr io.Writ
 		}
 		if tags := store.Tags(stashes[i].SHA); len(tags) > 0 {
 			stashes[i].Tags = tags
+		}
+		if note, ok := store.Note(stashes[i].SHA); ok {
+			stashes[i].Note = note
 		}
 	}
 
@@ -487,6 +497,206 @@ func runSearch(args []string, stdout, stderr io.Writer) int {
 // sidecar entries whose stash is gone for good (orphaned metadata).
 //
 // Interactivity: when stdin is a TTY and --dry-run is not set, it walks each
+// resolveStashByRef finds the stash whose ref matches the user-supplied token,
+// which may be a bare index ("1"), a full ref ("stash@{1}"), or the braced
+// form without the prefix ("{1}"). It returns the matched stash and true, or a
+// zero stash and false when no stash carries that index. stashes is the live
+// list from gitList (ordered stash@{0}..stash@{N}).
+func resolveStashByRef(stashes []model.Stash, ref string) (model.Stash, bool) {
+	tok := strings.TrimSpace(ref)
+	tok = strings.TrimPrefix(tok, "stash@")
+	tok = strings.TrimPrefix(tok, "{")
+	tok = strings.TrimSuffix(tok, "}")
+	tok = strings.TrimSpace(tok)
+	for _, s := range stashes {
+		if itoaExported(s.Index) == tok {
+			return s, true
+		}
+	}
+	return model.Stash{}, false
+}
+
+// itoaExported formats a non-negative int without pulling strconv into hot
+// paths; kept local to the command for the note ref matcher.
+func itoaExported(n int) string {
+	return fmt.Sprintf("%d", n)
+}
+
+// runNote implements `stash-stash note <stash-ref> [-m "text"] [--clear]`:
+// attach, edit, print, or clear the free-form "why" note on a stash, persisted
+// in the sidecar keyed by content SHA so it survives stack reshuffles (issue
+// #22).
+//
+// Modes:
+//   - `-m "text"`    sets the note verbatim.
+//   - `--clear`       removes the note.
+//   - no -m, TTY      opens $EDITOR (seeded with any existing note) to edit.
+//   - no -m, non-TTY  prints the existing note (script-friendly); empty exits 0.
+//
+// It returns 0 on success, 2 on bad flags/usage, 1 on a git/sidecar failure.
+func runNote(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("stash-stash note", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fmt.Fprintf(stderr, "stash-stash note \u2014 attach the *why* to a stash so a 3-week-old stash still makes sense.\n\n")
+		fmt.Fprintf(stderr, "Usage:\n  stash-stash note <stash-ref> [-m \"text\"] [--clear]\n\nFlags:\n")
+		fs.PrintDefaults()
+	}
+	msg := fs.String("m", "", "note text to record; omit to open $EDITOR (TTY) or print the existing note (pipe)")
+	clear := fs.Bool("clear", false, "remove the stash's note")
+	mSet := false
+
+	// Go's flag package stops at the first non-flag arg, so `note 1 -m "x"`
+	// would otherwise swallow -m as a positional. Pull a leading bare ref out
+	// before parsing so both `note 1 -m x` and `note -m x 1` work.
+	var ref string
+	rest := args
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
+		ref = rest[0]
+		rest = rest[1:]
+	}
+	if err := fs.Parse(rest); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "m" {
+			mSet = true
+		}
+	})
+	// A trailing ref (e.g. `note -m x 1`) is honored when no leading ref given.
+	if ref == "" {
+		ref = strings.TrimSpace(strings.Join(fs.Args(), " "))
+	}
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		fmt.Fprintln(stderr, "stash-stash note: missing <stash-ref> (e.g. `note 0` or `note stash@{0}`).")
+		return 2
+	}
+	if *clear && mSet {
+		fmt.Fprintln(stderr, "stash-stash note: use either -m or --clear, not both.")
+		return 2
+	}
+
+	ctx := context.Background()
+	stashes, err := gitList(ctx)
+	if err != nil {
+		if errors.Is(err, git.ErrNotARepo) {
+			fmt.Fprintln(stderr, "stash-stash: not a git repository (run me inside one).")
+			return 1
+		}
+		fmt.Fprintf(stderr, "stash-stash: %v\n", err)
+		return 1
+	}
+
+	target, ok := resolveStashByRef(stashes, ref)
+	if !ok {
+		fmt.Fprintf(stderr, "stash-stash note: no stash matches %q (there %s %d stash%s).\n",
+			ref, plural2(len(stashes), "is", "are"), len(stashes), plural2(len(stashes), "", "es"))
+		return 1
+	}
+
+	store, err := metaLoad(ctx)
+	if err != nil {
+		fmt.Fprintf(stderr, "stash-stash note: sidecar metadata unavailable (%v).\n", err)
+		return 1
+	}
+	existing, _ := store.Note(target.SHA)
+
+	// Read-only path: no -m and no --clear on a non-TTY just prints the note.
+	if !mSet && !*clear && !stdoutIsTTY() {
+		if existing != "" {
+			fmt.Fprintln(stdout, existing)
+		}
+		return 0
+	}
+
+	var newNote string
+	switch {
+	case *clear:
+		newNote = ""
+	case mSet:
+		newNote = *msg
+	default:
+		// Interactive edit via $EDITOR, seeded with the existing note.
+		edited, eerr := editViaEditor(existing)
+		if eerr != nil {
+			fmt.Fprintf(stderr, "stash-stash note: could not edit note (%v).\n", eerr)
+			return 1
+		}
+		newNote = edited
+	}
+
+	store.SetNote(target.SHA, newNote)
+	if err := store.Save(); err != nil {
+		fmt.Fprintf(stderr, "stash-stash note: could not save note (%v).\n", err)
+		return 1
+	}
+
+	if strings.TrimSpace(newNote) == "" {
+		fmt.Fprintf(stdout, "Note cleared for %s.\n", target.Ref())
+	} else {
+		fmt.Fprintf(stdout, "Note saved for %s.\n", target.Ref())
+	}
+	return 0
+}
+
+// plural2 is a tiny singular/plural picker for the note command's messages,
+// kept local so the leaf packages stay import-light.
+func plural2(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// editViaEditor opens $EDITOR (falling back to $VISUAL, then vi) on a temp file
+// seeded with seed, and returns the edited contents. It is only invoked on a
+// TTY. A non-zero editor exit or spawn failure is returned as an error so the
+// caller can report it and leave the note untouched.
+func editViaEditor(seed string) (string, error) {
+	editor := strings.TrimSpace(os.Getenv("EDITOR"))
+	if editor == "" {
+		editor = strings.TrimSpace(os.Getenv("VISUAL"))
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+
+	tmp, err := os.CreateTemp("", "stash-stash-note-*.txt")
+	if err != nil {
+		return "", err
+	}
+	name := tmp.Name()
+	defer func() { _ = os.Remove(name) }()
+	if seed != "" {
+		if _, err := tmp.WriteString(seed); err != nil {
+			_ = tmp.Close()
+			return "", err
+		}
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+
+	// #nosec G204 -- editor comes from the user's own environment, by design.
+	cmd := exec.Command("sh", "-c", editor+" \"$1\"", "sh", name)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
+	data, err := os.ReadFile(name)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
 // finding and prompts — restore/diff/skip for a dangling stash, delete/skip for
 // an orphaned label. Restoring re-attaches the commit to the stack with
 // `git stash store` (non-destructive: it only adds a ref). Without a TTY (pipe,

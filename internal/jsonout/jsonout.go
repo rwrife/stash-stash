@@ -43,6 +43,7 @@ type Stash struct {
 	Label       string    `json:"label,omitempty"`
 	AutoLabel   string    `json:"auto_label,omitempty"`
 	Tags        []string  `json:"tags"`
+	Note        string    `json:"note,omitempty"`
 	Display     string    `json:"display"`
 	LabelSource string    `json:"label_source"`
 	Subject     string    `json:"subject"`
@@ -95,6 +96,7 @@ func Write(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) err
 			Label:       s.Label,
 			AutoLabel:   s.AutoLabel(),
 			Tags:        jsonTags(s.Tags),
+			Note:        s.Note,
 			Display:     display,
 			LabelSource: srcKind.String(),
 			Subject:     s.Subject,

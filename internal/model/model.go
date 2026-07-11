@@ -101,6 +101,10 @@ type Stash struct {
 	// tags. They drive `--tag` filtering and render inline in the list.
 	Tags []string
 
+	// Note is the stash's free-form multi-line "why", from sidecar metadata
+	// (issue #22), matched by SHA. Empty when the stash has no stored note.
+	Note string
+
 	// TopFile is the stash's most significant changed file path, used to derive
 	// an auto-label when no explicit Label exists (issue #7). It is populated by
 	// git.EnrichDiffstats alongside Diffstat (same `git stash show --numstat`

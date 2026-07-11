@@ -14,7 +14,7 @@ gently nags you to revive or bury the stashes rotting at the bottom.
 │   [wip] half-done modal             5d    feature/x +88 -1  4f   │
 │   experiment: swap json lib         23d   main      +4  -4  1f   │
 └──────────────────────────────────────────────────────────────────┘
-  ↑/↓ move · a apply · p pop · d drop · b branch · l label · t tags · / filter · q quit
+  ↑/↓ move · a apply · p pop · d drop · b branch · l label · t tags · n note · / filter · q quit
 ```
 
 ## Why
@@ -83,6 +83,9 @@ stash-stash --version        # print the version
 stash-stash --no-tui         # force the plain table even on a TTY
 stash-stash | cat            # piped/non-TTY → plain table automatically
 stash-stash push -m "label"  # stash with a label that actually sticks
+stash-stash note 0 -m "blocked on #42"  # attach the *why* to a stash
+stash-stash note 0           # print the note (or edit via $EDITOR on a TTY)
+stash-stash note 0 --clear   # remove the note
 stash-stash search retry     # grep every stash's contents at once
 stash-stash search --regex 'retry.*=.*[0-9]'  # regex search (case-insensitive)
 stash-stash doctor           # find & restore lost stashes; clean orphaned labels
@@ -106,7 +109,8 @@ Run `stash-stash` inside a repo with stashes and you get a two-pane browser:
 
 Keys: `↑`/`↓` (or `j`/`k`) to select · `g`/`G` jump to top/bottom · **`l` to
 (re)label** the selected stash (`⏎` saves, `esc` cancels) · **`t` to edit tags**
-(comma-separated; `⏎` saves) · **`/` or `f` to filter** by tag · **`a` apply ·
+(comma-separated; `⏎` saves) · **`n` to add/edit a note** (`⏎` saves, `esc`
+cancels) · **`/` or `f` to filter** by tag · **`a` apply ·
 `p` pop · `d` drop** the selected stash · **`b` branch** (promote it to a new
 branch) · `⏎`/`space`/`PgDn` and `PgUp` to scroll the diff · `q` / `Ctrl-C` /
 `Esc` to quit. The layout is resize-aware.
@@ -162,6 +166,29 @@ stash-stash --json --tag experiment | jq '.stashes[].sha'
 `--tag` is repeatable and applies to both the plain table and `--json`. Every
 `--json` stash object carries a `tags` array (an empty `[]` when untagged), so
 consumers can filter or group without a nil check.
+
+### Notes — capture the *why*
+
+A label tells you *what* a stash is; a **note** tells you *why* you stashed it
+("blocked on the API change landing, revisit after #42"). Like labels and tags,
+notes live in the sidecar keyed by content SHA, so they survive
+`pop`/`push` reshuffling the stack.
+
+In the TUI, press **`n`** on the selected stash to add or edit its note (`⏎`
+saves, `esc` cancels). Stashes with a note show a **📝** marker in the list and
+the note appears at the top of the preview pane. The TUI editor is single-line;
+for a multi-line note use the CLI with `$EDITOR`:
+
+```bash
+stash-stash note 0 -m "blocked on #42; revisit after the retry lands"
+stash-stash note stash@{0}        # open $EDITOR (TTY), or print the note (pipe)
+stash-stash note 0 --clear        # remove the note
+stash-stash note 0 | cat          # script-friendly: prints the note to stdout
+```
+
+The stash ref may be a bare index (`0`), the braced form (`{0}`), or the full
+`stash@{0}`. Every `--json` stash object includes a `note` field when one is
+set, so scripts can surface the context too.
 
 ### Stashing with a label that sticks
 
@@ -335,6 +362,7 @@ Shape:
       "ref": "stash@{0}",
       "sha": "a1b2c3d",
       "label": "payments: retry fix",
+      "note": "blocked on #42; revisit after the retry lands",
       "auto_label": "main: retry",
       "display": "payments: retry fix",
       "label_source": "user",
@@ -356,7 +384,7 @@ Shape:
 
 Git can't name a stash well, so `stash-stash` keeps a tiny sidecar at
 `.git/stash-stash.json` mapping each stash's **content SHA** → your label (plus
-tags and notes in later milestones). Because the key is the content SHA — not
+tags and a free-form note). Because the key is the content SHA — not
 the volatile `stash@{N}` index — popping one stash or pushing another keeps your
 labels attached to the right work. Stale entries (for stashes dropped outside
 `stash-stash`) are pruned automatically on the next run.

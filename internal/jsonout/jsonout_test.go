@@ -190,3 +190,30 @@ func TestWriteIncludesTags(t *testing.T) {
 		t.Errorf("row1 tags = %v, want empty", got.Stashes[1].Tags)
 	}
 }
+
+func TestWriteIncludesNote(t *testing.T) {
+	now := time.Date(2026, 6, 21, 12, 0, 0, 0, time.UTC)
+	stashes := []model.Stash{
+		{Index: 0, SHA: "deadbeef", Subject: "WIP on main: x", Branch: "main",
+			Created: now.Add(-time.Hour), Note: "blocked on #42"},
+		{Index: 1, SHA: "cafebabe", Subject: "WIP on main: y", Branch: "main",
+			Created: now.Add(-time.Hour)}, // no note
+	}
+
+	var buf bytes.Buffer
+	if err := Write(&buf, stashes, now, 14); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+
+	var got Output
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if got.Stashes[0].Note != "blocked on #42" {
+		t.Errorf("row0 note = %q, want %q", got.Stashes[0].Note, "blocked on #42")
+	}
+	// note is omitempty: a noteless stash must not carry a "note" key.
+	if got.Stashes[1].Note != "" {
+		t.Errorf("row1 note = %q, want empty", got.Stashes[1].Note)
+	}
+}
