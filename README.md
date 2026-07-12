@@ -87,6 +87,7 @@ stash-stash note 0 -m "blocked on #42"  # attach the *why* to a stash
 stash-stash note 0           # print the note (or edit via $EDITOR on a TTY)
 stash-stash note 0 --clear   # remove the note
 stash-stash search retry     # grep every stash's contents at once
+stash-stash check 0          # predict conflicts (non-mutating); exit code = verdict
 stash-stash search --regex 'retry.*=.*[0-9]'  # regex search (case-insensitive)
 stash-stash doctor           # find & restore lost stashes; clean orphaned labels
 stash-stash doctor --dry-run # just report what's recoverable (no prompts)
@@ -122,6 +123,46 @@ pop or drop the list resyncs with git and the sidecar entry for the removed
 stash is pruned, so labels never drift. Git's own errors (e.g. a conflicting
 apply) are surfaced verbatim in a status toast, and the stash is left in place
 so you can resolve it.
+
+**Conflict pre-flight.** Before an `a` (apply) or `p` (pop), stash-stash runs a
+*non-mutating* test-merge to predict whether the stash will conflict with your
+current working state — without ever touching your working tree, index, or the
+stash stack. If a clean apply is predicted, nothing changes: it's still a single
+keypress. If a conflict is predicted, you get an extra explicit prompt naming
+the conflicting files ("…will conflict in N files — apply anyway? (y/N)") so
+you're never surprised by a wrecked tree *after* the fact. If the check can't
+determine cleanliness (e.g. an older `git`), it **fails open**: the action
+proceeds with a short "couldn't pre-check for conflicts" note rather than
+blocking you from your own work.
+
+### Scripting the conflict check (`check`)
+
+For pipelines and non-interactive use, `stash-stash check <stash-ref>` runs the
+same non-mutating pre-flight and reports the verdict via the exit code (the
+conflicting paths, if any, are printed to stdout; a human note goes to stderr):
+
+```bash
+stash-stash check              # defaults to stash@{0}
+stash-stash check stash@{2}
+```
+
+| Exit | Meaning |
+|------|---------|
+| `0`  | Predicted clean — safe to apply |
+| `3`  | Predicted **conflict** — would not apply cleanly (paths on stdout) |
+| `4`  | Undetermined — couldn't pre-check (fail open; treat as "unknown") |
+| `1`  | Error (not a git repo, or a hard git failure) |
+| `2`  | Usage error |
+
+So a wrapper can enforce its own policy, e.g. block only on a real conflict:
+
+```bash
+stash-stash check stash@{0}; case $? in
+  0) git stash apply ;;                 # clean
+  3) echo "skipping: would conflict" ;; # conflict
+  *) git stash apply ;;                 # unknown -> fail open
+esac
+```
 
 ### Promote a stash to a branch
 

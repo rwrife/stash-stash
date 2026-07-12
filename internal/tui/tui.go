@@ -39,6 +39,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/rwrife/stash-stash/internal/age"
+	"github.com/rwrife/stash-stash/internal/git"
 	"github.com/rwrife/stash-stash/internal/meta"
 	"github.com/rwrife/stash-stash/internal/model"
 	"github.com/rwrife/stash-stash/internal/render"
@@ -59,6 +60,13 @@ type ActionFunc func(ctx context.Context, ref string) error
 // reloads and prunes afterwards as it does for pop/drop.
 type BranchFunc func(ctx context.Context, name, ref string) error
 
+// PreflightFunc predicts, without mutating anything, whether applying a stash
+// ref would conflict with the current working state (issue #23). It mirrors
+// git.WouldConflict and is injected so the model is testable without a real
+// repo. A nil PreflightFunc disables the pre-flight step: apply/pop behave
+// exactly as they did before the feature landed.
+type PreflightFunc func(ctx context.Context, ref string) (git.PreflightResult, error)
+
 // ReloadFunc returns the current, freshly-enriched stash list (labels +
 // diffstats applied), used after a pop/drop to resync the view with git since
 // stash@{N} indices shift. It mirrors the load path in main and is injected so
@@ -69,11 +77,12 @@ type ReloadFunc func(ctx context.Context) ([]model.Stash, error)
 // (all-nil funcs) cleanly disables the action keys (they report "unavailable"),
 // which is handy in tests and non-mutating contexts.
 type Actions struct {
-	Apply  ActionFunc
-	Pop    ActionFunc
-	Drop   ActionFunc
-	Branch BranchFunc
-	Reload ReloadFunc
+	Apply     ActionFunc
+	Pop       ActionFunc
+	Drop      ActionFunc
+	Branch    BranchFunc
+	Reload    ReloadFunc
+	Preflight PreflightFunc
 }
 
 // labeler is the subset of *meta.Store the TUI needs to persist relabels, tag
@@ -269,6 +278,16 @@ type actionDoneMsg struct {
 	didMutate bool // the git op succeeded (so the stash set changed)
 }
 
+// preflightDoneMsg carries the result of the async, non-mutating conflict probe
+// (issue #23) back to the model so the pending apply/pop can resume: proceed
+// cleanly, warn-and-proceed (undetermined), or open the conflict confirm.
+type preflightDoneMsg struct {
+	kind   actionKind
+	ref    string
+	result git.PreflightResult
+	err    error
+}
+
 // Model is the Bubble Tea model for the stash browser.
 type Model struct {
 	stashes []model.Stash
@@ -327,7 +346,15 @@ type Model struct {
 	actions    Actions    // mutating ops (apply/pop/drop) + reload; zero disables
 	confirming bool       // true while a y/n destructive-action prompt is open
 	pending    actionKind // which destructive action awaits confirmation
-	busy       bool       // true while a mutating op is in flight (input locked)
+
+	// conflictPrompt is set while an extra "predicted conflict" confirm is open
+	// for apply/pop (issue #23). It holds the conflicting paths to display; the
+	// pending action is still m.pending. It is distinct from confirming so a
+	// clean pop still shows its normal destructive y/N, while a conflicting
+	// apply/pop shows the conflict-specific prompt.
+	conflictPrompt bool
+	conflictFiles  []string
+	busy           bool // true while a mutating op is in flight (input locked)
 
 	// --- M6 staleness ---
 	staleDays int // age threshold (days) for "gathering dust"; 0 disables
@@ -457,6 +484,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case actionDoneMsg:
 		return m.handleActionDone(msg)
+	case preflightDoneMsg:
+		return m.handlePreflightDone(msg)
 	}
 
 	// Forward anything else (e.g. mouse) to the viewport for scrolling.
@@ -487,6 +516,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.confirming {
 		return m.handleConfirmKey(msg)
+	}
+	if m.conflictPrompt {
+		return m.handleConflictKey(msg)
 	}
 	if m.busy {
 		// Allow only a hard quit while an action is running.
@@ -985,12 +1017,83 @@ func (m Model) startAction(kind actionKind) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.notice = ""
+	// Conflict pre-flight (issue #23): apply and pop both mutate the working
+	// tree, so before doing anything predict whether the stash would conflict.
+	// The probe is non-mutating; a clean/undetermined result falls through to the
+	// normal flow, a predicted conflict opens an extra explicit confirm.
+	if (kind == actionApply || kind == actionPop) && m.actions.Preflight != nil {
+		s, _ := m.selected()
+		m.busy = true
+		m.notice = "Checking " + s.Ref() + " for conflicts…"
+		return m, m.runPreflightCmd(kind, s.Ref())
+	}
+	return m.afterPreflight(kind, git.PreflightResult{})
+}
+
+// afterPreflight resumes the action flow once a (possibly empty) pre-flight
+// result is known. A predicted conflict opens the conflict confirm; otherwise
+// an undetermined result annotates the toast and both fall through to the
+// original behaviour (pop/drop still open their destructive y/N; apply fires).
+func (m Model) afterPreflight(kind actionKind, pf git.PreflightResult) (tea.Model, tea.Cmd) {
+	if _, ok := m.selected(); !ok {
+		return m, nil
+	}
+	if pf.Conflicts {
+		m.conflictPrompt = true
+		m.pending = kind
+		m.conflictFiles = pf.Files
+		return m, nil
+	}
+	prefix := ""
+	if pf.Undetermined {
+		// Fail open: proceed, but be honest that we couldn't pre-check.
+		prefix = git.PreflightNote(pf) + " · "
+	}
 	if kind.needsConfirm() {
 		m.confirming = true
 		m.pending = kind
+		if prefix != "" {
+			m.notice = strings.TrimSuffix(prefix, " · ")
+		}
 		return m, nil
 	}
-	return m.fireAction(kind)
+	mm, cmd := m.fireAction(kind)
+	if prefix != "" {
+		if fm, ok := mm.(Model); ok {
+			fm.notice = prefix + fm.notice
+			return fm, cmd
+		}
+	}
+	return mm, cmd
+}
+
+// runPreflightCmd returns a command that runs the non-mutating conflict probe
+// and reports the result back as a preflightDoneMsg. A probe error other than
+// "not a repo" is folded into an undetermined result (fail open) so the action
+// can still proceed.
+func (m Model) runPreflightCmd(kind actionKind, ref string) tea.Cmd {
+	fn := m.actions.Preflight
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		pf, err := fn(ctx, ref)
+		if err != nil {
+			return preflightDoneMsg{kind: kind, ref: ref, err: err}
+		}
+		return preflightDoneMsg{kind: kind, ref: ref, result: pf}
+	}
+}
+
+// handlePreflightDone resumes the action once the async probe returns. A hard
+// error (only ErrNotARepo in practice) is surfaced and the action aborted; any
+// other result flows through afterPreflight.
+func (m Model) handlePreflightDone(msg preflightDoneMsg) (tea.Model, tea.Cmd) {
+	m.busy = false
+	if msg.err != nil {
+		m.notice = msg.ref + ": " + condense(msg.err.Error())
+		return m, nil
+	}
+	return m.afterPreflight(msg.kind, msg.result)
 }
 
 // actionFunc returns the injected func for a kind, or nil if unavailable.
@@ -1018,6 +1121,31 @@ func (m Model) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	default:
 		m.confirming = false
 		m.notice = m.pending.verb() + " cancelled"
+		return m, nil
+	}
+}
+
+// handleConflictKey drives the predicted-conflict confirm (issue #23): 'y'
+// proceeds with the apply/pop despite the predicted conflict (falling through
+// to pop's own destructive confirm where applicable); anything else cancels.
+func (m Model) handleConflictKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch strings.ToLower(msg.String()) {
+	case "y":
+		kind := m.pending
+		m.conflictPrompt = false
+		m.conflictFiles = nil
+		// Pop still deletes the entry, so keep its destructive y/N confirm even
+		// after the user accepted the conflict risk. Apply fires immediately.
+		if kind.needsConfirm() {
+			m.confirming = true
+			m.pending = kind
+			return m, nil
+		}
+		return m.fireAction(kind)
+	default:
+		m.conflictPrompt = false
+		m.conflictFiles = nil
+		m.notice = m.pending.verb() + " cancelled (predicted conflict)"
 		return m, nil
 	}
 }
@@ -1337,6 +1465,30 @@ func (m Model) footer() string {
 		}
 		return editPromptStyle.Render(label+": ") + m.input.View() +
 			helpStyle.Render("  ⏎ create · esc cancel")
+	}
+	if m.conflictPrompt {
+		ref := ""
+		if haveSel {
+			ref = " " + sel.Ref()
+		}
+		n := len(m.conflictFiles)
+		files := ""
+		if n > 0 {
+			shown := m.conflictFiles
+			const maxShown = 4
+			suffix := ""
+			if len(shown) > maxShown {
+				suffix = fmt.Sprintf(" +%d more", len(shown)-maxShown)
+				shown = shown[:maxShown]
+			}
+			files = " (" + strings.Join(shown, ", ") + suffix + ")"
+		}
+		noun := "file"
+		if n != 1 {
+			noun += "s"
+		}
+		return confirmStyle.Render(fmt.Sprintf("%s%s will conflict in %d %s%s — %s anyway? (y/N)",
+			capitalize(m.pending.imperative()), ref, n, noun, files, m.pending.imperative()))
 	}
 	if m.confirming {
 		ref := ""

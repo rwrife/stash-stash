@@ -86,6 +86,7 @@ var (
 	metaLoad = meta.Load
 	gitList  = git.List
 	gitShow  = git.Show
+	gitCheck = git.WouldConflict
 
 	// Doctor (issue #10) indirections, so runDoctor can be unit-tested without a
 	// real repo, dangling commits, or sidecar file.
@@ -116,12 +117,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "note" {
 		return runNote(args[1:], os.Stdin, stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "check" {
+		return runCheck(args[1:], stdout, stderr)
+	}
 
 	fs := flag.NewFlagSet("stash-stash", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "stash-stash %s — a concierge for your git stash graveyard.\n\n", version)
-		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n  stash-stash note <stash-ref> [-m \"text\"]\n  stash-stash doctor [--dry-run]\n\nFlags:\n")
+		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n  stash-stash note <stash-ref> [-m \"text\"]\n  stash-stash check <stash-ref>\n  stash-stash doctor [--dry-run]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	showVersion := fs.Bool("version", false, "print version and exit")
@@ -226,10 +230,11 @@ func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool, tagFilt
 		// can resync after a pop/drop (indices shift). It is best-effort: a
 		// reload error is surfaced in-TUI, not fatal.
 		actions := tui.Actions{
-			Apply:  git.Apply,
-			Pop:    git.Pop,
-			Drop:   git.Drop,
-			Branch: git.Branch,
+			Apply:     git.Apply,
+			Pop:       git.Pop,
+			Drop:      git.Drop,
+			Branch:    git.Branch,
+			Preflight: git.WouldConflict,
 			Reload: func(ctx context.Context) ([]model.Stash, error) {
 				fresh, err := gitList(ctx)
 				if err != nil {
@@ -390,6 +395,72 @@ func runPush(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintf(stdout, "Stashed and labeled %q. 🏷️\n", label)
 	return 0
+}
+
+// runCheck implements `stash-stash check <stash-ref>`: a non-interactive,
+// non-mutating conflict pre-flight (issue #23). It predicts whether applying
+// the given stash would conflict with the current working state and reports the
+// verdict so scripts and pipes aren't blind to what the TUI's apply/pop confirm
+// would warn about.
+//
+// Exit codes are the script contract:
+//
+//	0 — predicted clean (safe to apply)
+//	1 — a real failure (not a repo, or a hard git error)
+//	2 — bad usage
+//	3 — predicted CONFLICT (the ref would not apply cleanly)
+//	4 — undetermined (couldn't pre-check; fail open — treat like "unknown")
+//
+// The distinct 3/4 codes let a wrapper script decide its own policy (block on
+// conflict, proceed-with-note on undetermined) without parsing text.
+func runCheck(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("stash-stash check", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fmt.Fprintf(stderr, "stash-stash check — predict whether a stash applies cleanly (no mutation).\n\n")
+		fmt.Fprintf(stderr, "Usage:\n  stash-stash check <stash-ref>   (default stash@{0})\n\nExit codes: 0 clean · 3 conflict · 4 undetermined · 1 error · 2 usage\n")
+	}
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			return 0
+		}
+		return 2
+	}
+	ref := "stash@{0}"
+	if fs.NArg() > 0 {
+		ref = fs.Arg(0)
+	}
+	if fs.NArg() > 1 {
+		fmt.Fprintf(stderr, "stash-stash check: too many arguments (want a single stash ref)\n")
+		return 2
+	}
+
+	res, err := gitCheck(context.Background(), ref)
+	if err != nil {
+		if errors.Is(err, git.ErrNotARepo) {
+			fmt.Fprintln(stderr, "stash-stash: not a git repository (run me inside one).")
+			return 1
+		}
+		fmt.Fprintf(stderr, "stash-stash: %v\n", err)
+		return 1
+	}
+
+	switch {
+	case res.Conflicts:
+		// Human note to stderr (so stdout stays clean for piping); machine signal
+		// in the exit code.
+		fmt.Fprintf(stderr, "stash-stash: %s\n", git.PreflightNote(res))
+		for _, f := range res.Files {
+			fmt.Fprintln(stdout, f)
+		}
+		return 3
+	case res.Undetermined:
+		fmt.Fprintf(stderr, "stash-stash: %s\n", git.PreflightNote(res))
+		return 4
+	default:
+		fmt.Fprintf(stdout, "%s is predicted to apply cleanly. ✅\n", ref)
+		return 0
+	}
 }
 
 // runSearch implements `stash-stash search <term> [--regex]`: it greps across
