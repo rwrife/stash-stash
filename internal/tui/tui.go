@@ -81,6 +81,10 @@ type Actions struct {
 	Pop       ActionFunc
 	Drop      ActionFunc
 	Branch    BranchFunc
+	// Compost archives the selected stash into refs/stash-stash/archive/<sha>
+	// and removes it from the stack (issue #27). It mirrors ActionFunc so the
+	// model stays uniform; a nil Compost disables the `c` key gracefully.
+	Compost   ActionFunc
 	Reload    ReloadFunc
 	Preflight PreflightFunc
 }
@@ -204,6 +208,7 @@ const (
 	actionPop
 	actionDrop
 	actionBranch
+	actionCompost
 )
 
 func (a actionKind) verb() string {
@@ -216,6 +221,8 @@ func (a actionKind) verb() string {
 		return "dropped"
 	case actionBranch:
 		return "branched"
+	case actionCompost:
+		return "composted"
 	default:
 		return "done"
 	}
@@ -233,6 +240,8 @@ func (a actionKind) imperative() string {
 		return "drop"
 	case actionBranch:
 		return "branch"
+	case actionCompost:
+		return "compost"
 	default:
 		return "act on"
 	}
@@ -246,6 +255,8 @@ func (a actionKind) consequence() string {
 		return "applies then removes it from the stack"
 	case actionDrop:
 		return "deletes it (recoverable only via reflog)"
+	case actionCompost:
+		return "archives it (removed from the list, still 100% recoverable)"
 	default:
 		return ""
 	}
@@ -254,13 +265,13 @@ func (a actionKind) consequence() string {
 // needsConfirm reports whether the action opens a y/N confirm prompt before
 // running (pop and drop). Apply runs immediately; branch instead gates on the
 // inline branch-name editor, so neither needs the y/N prompt.
-func (a actionKind) needsConfirm() bool { return a == actionPop || a == actionDrop }
+func (a actionKind) needsConfirm() bool { return a == actionPop || a == actionDrop || a == actionCompost }
 
 // removesStash reports whether a successful action removes the stash from the
 // stack and therefore requires a post-op reload + sidecar prune (pop, drop, and
 // branch — which applies-then-drops). Apply leaves the stack unchanged.
 func (a actionKind) removesStash() bool {
-	return a == actionPop || a == actionDrop || a == actionBranch
+	return a == actionPop || a == actionDrop || a == actionBranch || a == actionCompost
 }
 
 // actionDoneMsg carries the result of a mutating git op plus the context
@@ -559,6 +570,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.startAction(actionPop)
 	case "d":
 		return m.startAction(actionDrop)
+	case "c":
+		return m.startAction(actionCompost)
 
 	// Preview-pane scrolling.
 	case "pgup", "ctrl+b":
@@ -1105,6 +1118,8 @@ func (m Model) actionFunc(kind actionKind) ActionFunc {
 		return m.actions.Pop
 	case actionDrop:
 		return m.actions.Drop
+	case actionCompost:
+		return m.actions.Compost
 	default:
 		return nil
 	}
@@ -1212,6 +1227,8 @@ func (m Model) gerund(kind actionKind) string {
 		return "dropping"
 	case actionBranch:
 		return "branching"
+	case actionCompost:
+		return "composting"
 	default:
 		return "working"
 	}
@@ -1505,7 +1522,7 @@ func (m Model) footer() string {
 	if len(m.filterTags) > 0 {
 		filterHint = "/ filter*"
 	}
-	return helpStyle.Render("↑/↓ select · l label · t tags · n note · " + filterHint + " · b branch · a apply · p pop · d drop · q quit")
+	return helpStyle.Render("↑/↓ select · l label · t tags · n note · " + filterHint + " · b branch · a apply · p pop · d drop · c compost · q quit")
 }
 
 // renderList draws the visible (filtered) stash rows, highlighting the cursor
