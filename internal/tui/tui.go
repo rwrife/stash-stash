@@ -77,10 +77,10 @@ type ReloadFunc func(ctx context.Context) ([]model.Stash, error)
 // (all-nil funcs) cleanly disables the action keys (they report "unavailable"),
 // which is handy in tests and non-mutating contexts.
 type Actions struct {
-	Apply     ActionFunc
-	Pop       ActionFunc
-	Drop      ActionFunc
-	Branch    BranchFunc
+	Apply  ActionFunc
+	Pop    ActionFunc
+	Drop   ActionFunc
+	Branch BranchFunc
 	// Compost archives the selected stash into refs/stash-stash/archive/<sha>
 	// and removes it from the stack (issue #27). It mirrors ActionFunc so the
 	// model stays uniform; a nil Compost disables the `c` key gracefully.
@@ -265,7 +265,9 @@ func (a actionKind) consequence() string {
 // needsConfirm reports whether the action opens a y/N confirm prompt before
 // running (pop and drop). Apply runs immediately; branch instead gates on the
 // inline branch-name editor, so neither needs the y/N prompt.
-func (a actionKind) needsConfirm() bool { return a == actionPop || a == actionDrop || a == actionCompost }
+func (a actionKind) needsConfirm() bool {
+	return a == actionPop || a == actionDrop || a == actionCompost
+}
 
 // removesStash reports whether a successful action removes the stash from the
 // stack and therefore requires a post-op reload + sidecar prune (pop, drop, and
