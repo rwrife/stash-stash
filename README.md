@@ -14,7 +14,7 @@ gently nags you to revive or bury the stashes rotting at the bottom.
 │   [wip] half-done modal             5d    feature/x +88 -1  4f   │
 │   experiment: swap json lib         23d   main      +4  -4  1f   │
 └──────────────────────────────────────────────────────────────────┘
-  ↑/↓ move · a apply · p pop · d drop · b branch · l label · t tags · n note · / filter · q quit
+  ↑/↓ move · a apply · p pop · d drop · c compost · b branch · l label · t tags · n note · / filter · q quit
 ```
 
 ## Why
@@ -91,6 +91,9 @@ stash-stash check 0          # predict conflicts (non-mutating); exit code = ver
 stash-stash search --regex 'retry.*=.*[0-9]'  # regex search (case-insensitive)
 stash-stash doctor           # find & restore lost stashes; clean orphaned labels
 stash-stash doctor --dry-run # just report what's recoverable (no prompts)
+stash-stash compost          # archive stale stashes (recoverable forever)
+stash-stash compost --list   # list archived stashes
+stash-stash compost --restore abc123  # bring an archived stash back
 stash-stash --tag wip        # only stashes tagged #wip (table or --json)
 stash-stash --tag wip --tag hotfix  # AND: stashes carrying *both* tags
 stash-stash --stale-days 7   # flag anything older than a week as dusty
@@ -333,6 +336,55 @@ read-only report and changes nothing; restoring or deleting only happens behind
 an explicit keypress in an interactive terminal. Exit status is `0` on a clean
 bill of health or a completed triage, `2` on bad flags, and `1` on a git/sidecar
 failure.
+
+### Composting stale stashes (`compost`)
+
+Dropping a dusty stash is destructive — the commit is recoverable only via the
+reflog, and only until git garbage-collects it. **Compost** is the gentle
+alternative: instead of dropping an old stash, it *archives* it into the durable
+ref namespace `refs/stash-stash/archive/<sha>`. The stash drops off your active
+`git stash list`, but because a real ref keeps the commit reachable it stays
+**100% recoverable, forever** (git will never gc a pinned commit).
+
+Think of it as the counterpart to `doctor`: `doctor` rescues work you *already*
+lost, while `compost` makes sure stale work is retired *without* being lost in
+the first place.
+
+```bash
+stash-stash compost                 # archive every stash at/over --stale-days (default 14)
+stash-stash compost --stale-days 30 # only archive stashes older than 30 days
+stash-stash compost --stale-days 0  # archive ALL stashes
+stash-stash compost --list          # show what's been archived (nothing is lost)
+stash-stash compost --restore <id>  # bring one back as a live stash
+```
+
+In the **TUI**, press `c` to compost the selected stash. Like drop it asks for a
+`y/N` confirm first — but the consequence is friendlier: the stash is archived,
+not destroyed. After composting, the list resyncs with git just like a pop/drop.
+
+**Compost vs. drop:**
+
+| | `drop` (`d`) | `compost` (`c`) |
+| --- | --- | --- |
+| Removed from `git stash list` | yes | yes |
+| Commit kept reachable | no (reflog only, until gc) | **yes** (pinned ref, forever) |
+| Recoverable later | best-effort (`doctor`) | **guaranteed** (`compost --restore`) |
+| Metadata (label/tags/notes) | pruned | **preserved** (follows the stash) |
+
+How it works and stays safe:
+
+- **Archive** pins the stash commit under `refs/stash-stash/archive/<sha>`
+  *first*, then drops it from the stack. Because the durable ref is created
+  before the drop, a failed drop can never lose the commit.
+- **`--restore`** re-attaches the commit with `git stash store` (it reappears as
+  `stash@{0}`) *first*, then deletes the archive ref. You can pass a full SHA or
+  any unique prefix.
+- **Sidecar metadata follows automatically.** Labels, tags, and notes are keyed
+  by the stash's content SHA, which never changes — so a composted stash keeps
+  its metadata in the archive and gets it all back on restore, no extra work.
+
+Exit status is `0` on success (including "nothing stale to compost"), `2` on bad
+flags, and `1` on a git/sidecar failure.
 
 ## Auto-labels
 

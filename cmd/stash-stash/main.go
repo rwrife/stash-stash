@@ -92,6 +92,12 @@ var (
 	// real repo, dangling commits, or sidecar file.
 	gitDangling   = git.DanglingStashes
 	gitStoreStash = git.StoreStash
+
+	// Compost (issue #27) indirections, so runCompost can be unit-tested without
+	// a real repo, stashes, or archive refs.
+	gitArchive         = git.Archive
+	gitArchivedStashes = git.ArchivedStashes
+	gitRestore         = git.Restore
 )
 
 func main() {
@@ -120,12 +126,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "check" {
 		return runCheck(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "compost" {
+		return runCompost(args[1:], stdout, stderr)
+	}
 
 	fs := flag.NewFlagSet("stash-stash", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "stash-stash %s — a concierge for your git stash graveyard.\n\n", version)
-		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n  stash-stash note <stash-ref> [-m \"text\"]\n  stash-stash check <stash-ref>\n  stash-stash doctor [--dry-run]\n\nFlags:\n")
+		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n  stash-stash note <stash-ref> [-m \"text\"]\n  stash-stash check <stash-ref>\n  stash-stash compost [--stale-days N] [--list] [--restore <id>]\n  stash-stash doctor [--dry-run]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	showVersion := fs.Bool("version", false, "print version and exit")
@@ -230,10 +239,14 @@ func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool, tagFilt
 		// can resync after a pop/drop (indices shift). It is best-effort: a
 		// reload error is surfaced in-TUI, not fatal.
 		actions := tui.Actions{
-			Apply:     git.Apply,
-			Pop:       git.Pop,
-			Drop:      git.Drop,
-			Branch:    git.Branch,
+			Apply:  git.Apply,
+			Pop:    git.Pop,
+			Drop:   git.Drop,
+			Branch: git.Branch,
+			Compost: func(ctx context.Context, ref string) error {
+				_, err := git.Archive(ctx, ref)
+				return err
+			},
 			Preflight: git.WouldConflict,
 			Reload: func(ctx context.Context) ([]model.Stash, error) {
 				fresh, err := gitList(ctx)
