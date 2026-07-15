@@ -114,10 +114,20 @@ Run `stash-stash` inside a repo with stashes and you get a two-pane browser:
 Keys: `↑`/`↓` (or `j`/`k`) to select · `g`/`G` jump to top/bottom · **`l` to
 (re)label** the selected stash (`⏎` saves, `esc` cancels) · **`t` to edit tags**
 (comma-separated; `⏎` saves) · **`n` to add/edit a note** (`⏎` saves, `esc`
-cancels) · **`/` or `f` to filter** by tag · **`a` apply ·
+cancels) · **`/` or `f` to filter** by tag · **`space` to multi-select** the
+current row (`A` selects all, `N` clears) · **`a` apply ·
 `p` pop · `d` drop** the selected stash · **`b` branch** (promote it to a new
-branch) · `⏎`/`space`/`PgDn` and `PgUp` to scroll the diff · `q` / `Ctrl-C` /
+branch) · `PgDn`/`PgUp` (or `Ctrl-F`/`Ctrl-B`) to scroll the diff · `q` / `Ctrl-C` /
 `Esc` to quit. The layout is resize-aware.
+
+**Multi-select + bulk drop.** Press `space` to mark the highlighted stash (a
+pink `▸` appears in the gutter and the header shows `N selected`); `A` marks
+every visible stash and `N` clears the selection. With a selection active, `d`
+becomes a **bulk drop**: a single confirm lists every affected stash before
+anything is deleted, then all of them are dropped (highest index first, so the
+remaining refs stay valid) and the list resyncs once. With no selection, every
+key keeps its original single-stash behaviour, so nothing changes for the
+single-item workflow.
 
 **Actions are safe by default.** `a` (apply) is non-destructive and runs
 immediately. `p` (pop) and `d` (drop) move or delete work, so they pop a

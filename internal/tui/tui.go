@@ -29,6 +29,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -134,6 +135,15 @@ var (
 				Background(lipgloss.Color("63"))
 
 	itemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+
+	// selectMarkStyle tints the gutter marker shown on multi-selected rows
+	// (issue #28) so a batch selection is obvious at a glance, independent of the
+	// cursor highlight.
+	selectMarkStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
+
+	// selectCountStyle frames the "N selected" badge in the title row, echoing
+	// the pink of the row markers so the batch selection reads as one feature.
+	selectCountStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
 
 	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
 
@@ -371,6 +381,21 @@ type Model struct {
 
 	// --- M6 staleness ---
 	staleDays int // age threshold (days) for "gathering dust"; 0 disables
+
+	// --- issue #28: multi-select + bulk actions ---
+	// selected is the set of stash content SHAs the user has toggled with
+	// `space` (or `A` select-all). When non-empty, action keys operate on the
+	// whole set instead of the single cursor row. Keyed by SHA (not index) so a
+	// post-action reload that shifts stash@{N} indices never corrupts it. A nil
+	// or empty map means "no selection" and every action falls back to its
+	// original single-item behaviour.
+	selectedSHAs map[string]struct{}
+	// bulkConfirm is true while the bulk-drop y/N confirm prompt is open. It is
+	// distinct from confirming (the single-item destructive prompt) so the footer
+	// can list every affected stash rather than a single ref.
+	bulkConfirm bool
+	// bulkPending is the action awaiting bulk confirmation (only actionDrop today).
+	bulkPending actionKind
 }
 
 // New builds a Model over the given stashes, using show to fetch diffs, store
@@ -497,6 +522,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case actionDoneMsg:
 		return m.handleActionDone(msg)
+	case bulkDoneMsg:
+		return m.handleBulkDone(msg)
 	case preflightDoneMsg:
 		return m.handlePreflightDone(msg)
 	}
@@ -529,6 +556,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.confirming {
 		return m.handleConfirmKey(msg)
+	}
+	if m.bulkConfirm {
+		return m.handleBulkKey(msg)
 	}
 	if m.conflictPrompt {
 		return m.handleConflictKey(msg)
@@ -575,11 +605,19 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "c":
 		return m.startAction(actionCompost)
 
+	// --- issue #28: multi-select ---
+	case " ":
+		return m.toggleSelect()
+	case "A":
+		return m.selectAll()
+	case "N":
+		return m.clearSelection()
+
 	// Preview-pane scrolling.
 	case "pgup", "ctrl+b":
 		m.viewport.HalfViewUp()
 		return m, nil
-	case "pgdown", "ctrl+f", " ":
+	case "pgdown", "ctrl+f":
 		m.viewport.HalfViewDown()
 		return m, nil
 	}
@@ -1018,12 +1056,259 @@ func (m Model) moveCursor(delta int) (tea.Model, tea.Cmd) {
 	return m.moveCursorTo(m.cursor + delta)
 }
 
+// --- issue #28: multi-select + bulk actions ---
+
+// selectionCount returns how many stashes are currently multi-selected.
+func (m Model) selectionCount() int {
+	return len(m.selectedSHAs)
+}
+
+// isSelected reports whether the stash with the given SHA is in the current
+// multi-selection.
+func (m Model) isSelected(sha string) bool {
+	if m.selectedSHAs == nil || sha == "" {
+		return false
+	}
+	_, ok := m.selectedSHAs[sha]
+	return ok
+}
+
+// toggleSelect flips the multi-selection state of the stash under the cursor
+// (issue #28). It never moves the cursor, so the user can hold a position and
+// toggle, or space-then-arrow down a run of stashes. A no-op when there is no
+// selectable row (empty/filtered-empty list).
+func (m Model) toggleSelect() (tea.Model, tea.Cmd) {
+	sel, ok := m.selected()
+	if !ok || sel.SHA == "" {
+		return m, nil
+	}
+	if m.selectedSHAs == nil {
+		m.selectedSHAs = map[string]struct{}{}
+	}
+	if _, on := m.selectedSHAs[sel.SHA]; on {
+		delete(m.selectedSHAs, sel.SHA)
+	} else {
+		m.selectedSHAs[sel.SHA] = struct{}{}
+	}
+	m.notice = ""
+	return m, nil
+}
+
+// selectAll adds every currently-visible stash to the selection (issue #28). It
+// respects an active tag filter: only what the user can see is selected, so a
+// filtered "select all + drop" never touches hidden stashes.
+func (m Model) selectAll() (tea.Model, tea.Cmd) {
+	v := m.visible()
+	if len(v) == 0 {
+		return m, nil
+	}
+	if m.selectedSHAs == nil {
+		m.selectedSHAs = map[string]struct{}{}
+	}
+	for _, s := range v {
+		if s.SHA != "" {
+			m.selectedSHAs[s.SHA] = struct{}{}
+		}
+	}
+	m.notice = ""
+	return m, nil
+}
+
+// clearSelection drops the entire multi-selection (issue #28), returning to
+// single-item behaviour. It is bound to `N` and is also called after a bulk
+// action completes.
+func (m Model) clearSelection() (tea.Model, tea.Cmd) {
+	if len(m.selectedSHAs) == 0 {
+		return m, nil
+	}
+	m.selectedSHAs = nil
+	m.notice = "selection cleared"
+	return m, nil
+}
+
+// bulkTargets returns the selected stashes (resolved from live m.stashes by
+// SHA) sorted by descending stash index. Dropping highest-index-first keeps the
+// remaining stash@{N} refs valid as the stack collapses beneath each drop.
+func (m Model) bulkTargets() []model.Stash {
+	out := make([]model.Stash, 0, len(m.selectedSHAs))
+	for i := range m.stashes {
+		if _, ok := m.selectedSHAs[m.stashes[i].SHA]; ok {
+			out = append(out, m.stashes[i])
+		}
+	}
+	sort.Slice(out, func(a, b int) bool { return out[a].Index > out[b].Index })
+	return out
+}
+
+// startBulk opens the combined confirm prompt for a bulk action over the
+// current selection (issue #28). Only drop is supported today; the prompt lists
+// every affected stash so the user sees exactly what will be deleted before
+// committing. A no-op (with a toast) when the underlying action is unavailable.
+func (m Model) startBulk(kind actionKind) (tea.Model, tea.Cmd) {
+	if m.actionFunc(kind) == nil {
+		m.notice = kind.verb() + ": unavailable"
+		return m, nil
+	}
+	if m.selectionCount() == 0 {
+		return m, nil
+	}
+	m.bulkConfirm = true
+	m.bulkPending = kind
+	m.notice = ""
+	return m, nil
+}
+
+// handleBulkKey drives the bulk-drop confirm prompt: 'y' fires the batch,
+// anything else cancels (leaving the selection intact so the user can retry).
+func (m Model) handleBulkKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch strings.ToLower(msg.String()) {
+	case "y":
+		kind := m.bulkPending
+		m.bulkConfirm = false
+		return m.fireBulk(kind)
+	default:
+		m.bulkConfirm = false
+		m.notice = "bulk " + m.bulkPending.verb() + " cancelled"
+		return m, nil
+	}
+}
+
+// fireBulk locks the UI and dispatches the sequential batch command. The
+// captured target refs (highest index first) travel with the closure so the
+// op is order-stable even though each drop shifts the indices below it.
+func (m Model) fireBulk(kind actionKind) (tea.Model, tea.Cmd) {
+	targets := m.bulkTargets()
+	if len(targets) == 0 {
+		return m, nil
+	}
+	m.busy = true
+	m.notice = fmt.Sprintf("%s %d stashes…", capitalize(m.gerund(kind)), len(targets))
+	return m, m.runBulkCmd(kind, targets)
+}
+
+// bulkDoneMsg carries the result of a batch action back to the model: how many
+// succeeded, the first error (if any), and a freshly-reloaded stash list so the
+// view resyncs once at the end rather than after every individual drop.
+type bulkDoneMsg struct {
+	kind      actionKind
+	done      int
+	total     int
+	err       error
+	reloaded  []model.Stash
+	reloadErr error
+}
+
+// runBulkCmd returns a command that runs the action against each target ref in
+// order (highest stash index first, so lower refs stay valid), stopping at the
+// first error, then reloads the stash list once. Refs are captured up front:
+// after the first drop the live stash@{N} for a *lower*-index stash is
+// unchanged (only indices above the dropped one shift down), which is why
+// descending order is correct.
+func (m Model) runBulkCmd(kind actionKind, targets []model.Stash) tea.Cmd {
+	fn := m.actionFunc(kind)
+	reload := m.actions.Reload
+	refs := make([]string, len(targets))
+	for i, t := range targets {
+		refs[i] = t.Ref()
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		res := bulkDoneMsg{kind: kind, total: len(refs)}
+		for _, ref := range refs {
+			if err := fn(ctx, ref); err != nil {
+				res.err = fmt.Errorf("%s: %w", ref, err)
+				break
+			}
+			res.done++
+		}
+		if reload != nil {
+			stashes, rerr := reload(ctx)
+			res.reloaded = stashes
+			res.reloadErr = rerr
+		}
+		return res
+	}
+}
+
+// handleBulkDone resyncs the view after a batch action: swaps in the reloaded
+// list, prunes sidecar entries for every removed stash, clears the selection,
+// clamps the cursor, and reloads the preview. Partial success is reported
+// honestly ("dropped 2 of 3 — <err>").
+func (m Model) handleBulkDone(msg bulkDoneMsg) (tea.Model, tea.Cmd) {
+	m.busy = false
+	m.selectedSHAs = nil // selection always clears after a bulk action
+
+	// Prune sidecar entries for everything that is gone, keyed by the live SHAs.
+	if p, ok := m.store.(pruner); ok && msg.reloaded != nil {
+		live := map[string]struct{}{}
+		for _, s := range msg.reloaded {
+			live[s.SHA] = struct{}{}
+		}
+		if n := p.Prune(live); n > 0 {
+			_ = m.store.Save()
+		}
+	}
+
+	verb := msg.kind.verb()
+	switch {
+	case msg.err != nil:
+		m.notice = fmt.Sprintf("%s %d of %d — %s", verb, msg.done, msg.total, condense(msg.err.Error()))
+	case msg.reloadErr != nil:
+		m.notice = fmt.Sprintf("%s %d stashes (reload failed: %s)", verb, msg.done, condense(msg.reloadErr.Error()))
+	default:
+		m.notice = fmt.Sprintf("%s %d stashes", verb, msg.done)
+	}
+
+	if msg.reloaded != nil {
+		m.stashes = msg.reloaded
+	}
+
+	if len(m.stashes) == 0 {
+		m.cursor = 0
+		m.loadedFor = -1
+		m.currentDiff = ""
+		if m.ready {
+			m.viewport.SetContent(dimStyle.Render("No stashes left — graveyard cleared. 🪦"))
+		}
+		return m, nil
+	}
+
+	v := m.visible()
+	if len(v) == 0 {
+		m.cursor = 0
+		m.loadedFor = -1
+		m.currentDiff = ""
+		if m.ready {
+			m.viewport.SetContent(dimStyle.Render("No stashes match this tag filter. Press / to change it."))
+			m.viewport.GotoTop()
+		}
+		return m, nil
+	}
+	if m.cursor > len(v)-1 {
+		m.cursor = len(v) - 1
+	}
+	m.loadedFor = -1
+	m.loading = true
+	if m.ready {
+		m.viewport.SetContent(dimStyle.Render("Loading diff…"))
+		m.viewport.GotoTop()
+	}
+	return m, m.loadDiffCmd(m.cursor)
+}
+
 // startAction begins a mutating action on the selected stash. Apply runs
 // immediately (non-destructive); pop and drop open a y/n confirm prompt first.
 // (Branch is not routed here — it has its own inline name editor.) It is a
 // no-op (with an explanatory toast) when the action is unavailable (no injected
 // func) or there is no selection.
 func (m Model) startAction(kind actionKind) (tea.Model, tea.Cmd) {
+	// Issue #28: when a multi-selection is active, drop operates on the whole set
+	// via a single combined confirm. Other actions keep their single-item
+	// behaviour for now (the cursor row).
+	if kind == actionDrop && m.selectionCount() > 0 {
+		return m.startBulk(actionDrop)
+	}
 	if _, ok := m.selected(); !ok {
 		return m, nil
 	}
@@ -1418,6 +1703,12 @@ func (m Model) View() string {
 			filterStyle.Render("filter: "+render.FormatTags(m.filterTags)))
 	}
 
+	// Issue #28: reflect an active multi-selection in the title row.
+	if n := m.selectionCount(); n > 0 {
+		title = lipgloss.JoinHorizontal(lipgloss.Top, title,
+			selectCountStyle.Render(fmt.Sprintf("%d selected", n)))
+	}
+
 	list := listPaneStyle.
 		Width(m.listInnerW).
 		Height(m.innerH).
@@ -1517,6 +1808,25 @@ func (m Model) footer() string {
 		return confirmStyle.Render(fmt.Sprintf("%s%s? %s — (y/N)",
 			capitalize(m.pending.imperative()), ref, m.pending.consequence()))
 	}
+	if m.bulkConfirm {
+		targets := m.bulkTargets()
+		const maxShown = 5
+		labels := make([]string, 0, len(targets))
+		for _, t := range targets {
+			name := strings.TrimSpace(t.Display())
+			if name == "" {
+				name = t.Ref()
+			}
+			labels = append(labels, truncate(name, 24))
+		}
+		suffix := ""
+		if len(labels) > maxShown {
+			suffix = fmt.Sprintf(" +%d more", len(labels)-maxShown)
+			labels = labels[:maxShown]
+		}
+		return confirmStyle.Render(fmt.Sprintf("%s %d stashes (%s%s)? deletes them (recoverable only via reflog) — (y/N)",
+			capitalize(m.bulkPending.imperative()), len(targets), strings.Join(labels, ", "), suffix))
+	}
 	if m.notice != "" {
 		return helpStyle.Render(m.notice)
 	}
@@ -1524,7 +1834,10 @@ func (m Model) footer() string {
 	if len(m.filterTags) > 0 {
 		filterHint = "/ filter*"
 	}
-	return helpStyle.Render("↑/↓ select · l label · t tags · n note · " + filterHint + " · b branch · a apply · p pop · d drop · c compost · q quit")
+	if m.selectionCount() > 0 {
+		return helpStyle.Render(fmt.Sprintf("%d selected · space toggle · A all · N none · d drop selected · q quit", m.selectionCount()))
+	}
+	return helpStyle.Render("↑/↓ select · space mark · l label · t tags · n note · " + filterHint + " · b branch · a apply · p pop · d drop · c compost · q quit")
 }
 
 // renderList draws the visible (filtered) stash rows, highlighting the cursor
@@ -1575,6 +1888,15 @@ func (m Model) formatRow(s model.Stash) string {
 	if s.Note != "" {
 		head += "  " + noteIndicatorStyle.Render("\U0001F4DD")
 	}
+
+	// Issue #28: a selection marker in the gutter when this stash is part of a
+	// multi-select batch. A leading space keeps unselected rows aligned with
+	// selected ones so the list doesn't jump as selections toggle.
+	mark := "  "
+	if m.isSelected(s.SHA) {
+		mark = selectMarkStyle.Render("▸ ")
+	}
+	head = mark + head
 
 	// Second line: the human label if present (highlighted), an auto-derived
 	// label (dim + italic, so it reads as a guess), else the raw git subject.
