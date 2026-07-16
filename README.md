@@ -14,7 +14,7 @@ gently nags you to revive or bury the stashes rotting at the bottom.
 │   [wip] half-done modal             5d    feature/x +88 -1  4f   │
 │   experiment: swap json lib         23d   main      +4  -4  1f   │
 └──────────────────────────────────────────────────────────────────┘
-  ↑/↓ move · a apply · p pop · d drop · c compost · b branch · l label · t tags · n note · / filter · q quit
+  ↑/↓ move · a apply · p pop · d drop · c compost · b branch · l label · t tags · n note · / filter · f tags · q quit
 ```
 
 ## Why
@@ -68,7 +68,10 @@ go build -o stash-stash ./cmd/stash-stash
 > the sidecar is kept in sync on every mutation. **`b` promotes a stash to a
 > branch** (`git stash branch`) using a slugified version of its label as the
 > suggested branch name. **`t` tags the selected stash** (`wip`, `experiment`,
-> `hotfix`…) and **`/` (or `f`) live-filters** the list to stashes carrying all
+> `hotfix`…). **`/` opens a live fuzzy filter-as-you-type** that narrows the
+> list in real time against each stash's label, branch, tags, and note (esc
+> clears it, enter keeps the narrowed view), while **`f` filters by tag** —
+> stashes carrying all
 > the tags you type; on the CLI, `--tag <name>` (repeatable, AND) narrows both
 > the plain table and `--json`. `stash-stash push -m "label"`
 > stashes your working tree and records the label immediately. Stashes older
@@ -114,7 +117,8 @@ Run `stash-stash` inside a repo with stashes and you get a two-pane browser:
 Keys: `↑`/`↓` (or `j`/`k`) to select · `g`/`G` jump to top/bottom · **`l` to
 (re)label** the selected stash (`⏎` saves, `esc` cancels) · **`t` to edit tags**
 (comma-separated; `⏎` saves) · **`n` to add/edit a note** (`⏎` saves, `esc`
-cancels) · **`/` or `f` to filter** by tag · **`space` to multi-select** the
+cancels) · **`/` to fuzzy-filter** as you type (label/branch/tags/note) · **`f`
+to filter by tag** · **`space` to multi-select** the
 current row (`A` selects all, `N` clears) · **`a` apply ·
 `p` pop · `d` drop** the selected stash · **`b` branch** (promote it to a new
 branch) · `PgDn`/`PgUp` (or `Ctrl-F`/`Ctrl-B`) to scroll the diff · `q` / `Ctrl-C` /
@@ -203,11 +207,25 @@ along through `pop`/`push` reshuffles just like labels. They render inline under
 each row as compact `#tag` tokens (and in the plain table too).
 
 Once you've got more than a handful of stashes, **filter** down to what you care
-about. In the TUI press **`/`** (or **`f`**), type one or more tags, and the
+about. In the TUI press **`f`**, type one or more tags, and the
 list narrows to stashes carrying **all** of them (AND); the active filter shows
 in the title bar. Submit an empty filter to clear it. Editing a stash's tags
 re-evaluates the filter live, so retagging something out of the current view
 drops it immediately.
+
+#### Fuzzy filter-as-you-type
+
+For a quick, free-text narrow, press **`/`** to open the **live fuzzy filter**.
+Unlike the tag filter (which commits on `⏎`), this one applies on **every
+keystroke**: type a few characters and the list narrows in real time. The query
+is matched as a case-insensitive subsequence (`fzf`/lazygit style) against each
+stash's **label, origin branch, tags, and note** — a hit in any field keeps the
+row. The cursor always stays on a valid visible row, and an empty result shows a
+clear "no matches" state instead of a stale diff. Press **`esc`** to clear the
+filter and restore the full list, or **`⏎`** to keep the narrowed view and
+return to navigation (so you can `a`/`p`/`d`/`l` on the filtered rows). The tag
+filter and the fuzzy filter compose: when both are active, a stash must satisfy
+both.
 
 For scripting, the same filter is a flag:
 

@@ -1034,11 +1034,11 @@ func TestFilterNarrowsVisibleList(t *testing.T) {
 		t.Fatalf("visible before filter = %d, want 3", got)
 	}
 
-	// Open filter with '/', type a tag, apply.
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	// Open the tag filter with 'f', type a tag, apply.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
 	m = updated.(Model)
 	if !m.filtering {
-		t.Fatal("'/' did not open the filter prompt")
+		t.Fatal("'f' did not open the tag filter prompt")
 	}
 	m = typeRunes(t, m, "wip")
 	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -1073,7 +1073,7 @@ func TestFilterNarrowsVisibleList(t *testing.T) {
 	}
 
 	// Clear filter (empty entry) → all three back.
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
 	m = updated.(Model)
 	for i := 0; i < 20; i++ { // backspace any seeded text
 		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
