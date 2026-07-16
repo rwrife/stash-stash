@@ -1146,3 +1146,167 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// --- issue #28: multi-select + bulk actions ---
+
+// space toggles selection on the cursor row without moving the cursor, and the
+// header reflects the count. Toggling again clears just that row.
+func TestSpaceTogglesSelection(t *testing.T) {
+	m := sized(t)
+
+	// Select the top row (cursor starts at 0 → SHA "aaa").
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(Model)
+	if m.selectionCount() != 1 || !m.isSelected("aaa") {
+		t.Fatalf("after space: count=%d selected(aaa)=%v, want 1/true", m.selectionCount(), m.isSelected("aaa"))
+	}
+	if m.cursor != 0 {
+		t.Errorf("space moved the cursor to %d, want it to stay at 0", m.cursor)
+	}
+	if got := stripANSI(m.View()); !strings.Contains(got, "1 selected") {
+		t.Errorf("header missing selection count; view=%q", got)
+	}
+
+	// Space again on the same row clears it.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(Model)
+	if m.selectionCount() != 0 {
+		t.Fatalf("second space did not deselect; count=%d", m.selectionCount())
+	}
+}
+
+// A selects every visible row; N clears the whole selection.
+func TestSelectAllAndClear(t *testing.T) {
+	m := sized(t)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'A'}})
+	m = updated.(Model)
+	if m.selectionCount() != 3 {
+		t.Fatalf("select-all count=%d, want 3", m.selectionCount())
+	}
+	for _, sha := range []string{"aaa", "bbb", "ccc"} {
+		if !m.isSelected(sha) {
+			t.Errorf("select-all missed %s", sha)
+		}
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	m = updated.(Model)
+	if m.selectionCount() != 0 {
+		t.Fatalf("clear-all count=%d, want 0", m.selectionCount())
+	}
+}
+
+// With a selection active, 'd' opens a combined confirm listing every affected
+// stash; 'y' drops them all (highest index first), reloads once, and clears the
+// selection. The sidecar is pruned for the removed entries.
+func TestBulkDropConfirmAndFire(t *testing.T) {
+	var dropped []string
+	store := newFakeStore()
+	store.labels["aaa"] = "keep-me"
+	store.labels["bbb"] = "gone-b"
+	store.labels["ccc"] = "gone-c"
+	stashes := []model.Stash{
+		{Index: 0, SHA: "aaa", Label: "keep-me", Branch: "main", Created: fixedNow.Add(-2 * time.Hour)},
+		{Index: 1, SHA: "bbb", Label: "gone-b", Branch: "feature/x", Created: fixedNow.Add(-48 * time.Hour)},
+		{Index: 2, SHA: "ccc", Label: "gone-c", Branch: "main", Created: fixedNow.Add(-72 * time.Hour)},
+	}
+	// After dropping bbb and ccc only aaa remains (now index 0).
+	remaining := []model.Stash{{Index: 0, SHA: "aaa", Label: "keep-me", Branch: "main", Created: fixedNow}}
+	actions := Actions{Drop: recordingAction(&dropped, nil), Reload: reloadReturning(remaining, nil)}
+	m := New(stashes, stubShow, store, actions, fixedNow, 0, nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	// Select bbb (index 1) and ccc (index 2): move down and space each.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = updated.(Model)
+	if m.selectionCount() != 2 {
+		t.Fatalf("selection count=%d, want 2", m.selectionCount())
+	}
+
+	// 'd' must open the bulk confirm, not drop yet.
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	if !m.bulkConfirm {
+		t.Fatal("'d' with a selection did not open the bulk confirm")
+	}
+	if cmd != nil {
+		t.Fatal("bulk confirm should not fire the drop before 'y'")
+	}
+	foot := stripANSI(m.footer())
+	if !strings.Contains(foot, "gone-b") || !strings.Contains(foot, "gone-c") {
+		t.Errorf("bulk confirm should list affected labels; footer=%q", foot)
+	}
+
+	// 'y' fires the batch.
+	updated, cmd = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	m = updated.(Model)
+	m = runCmd(t, m, cmd)
+
+	// Both dropped, highest index first (ccc=stash@{2} before bbb=stash@{1}).
+	want := []string{"stash@{2}", "stash@{1}"}
+	if len(dropped) != 2 || dropped[0] != want[0] || dropped[1] != want[1] {
+		t.Fatalf("dropped=%v, want %v (descending index order)", dropped, want)
+	}
+	if m.selectionCount() != 0 {
+		t.Errorf("selection not cleared after bulk drop; count=%d", m.selectionCount())
+	}
+	if _, ok := store.labels["bbb"]; ok {
+		t.Errorf("sidecar entry for bbb not pruned")
+	}
+	if _, ok := store.labels["aaa"]; !ok {
+		t.Errorf("sidecar entry for surviving aaa was wrongly pruned")
+	}
+}
+
+// Cancelling the bulk confirm (any non-y key) drops nothing and keeps the
+// selection so the user can retry.
+func TestBulkDropCancelKeepsSelection(t *testing.T) {
+	var dropped []string
+	actions := Actions{Drop: recordingAction(&dropped, nil), Reload: reloadReturning(nil, nil)}
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0, nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'A'}})
+	m = updated.(Model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	m = updated.(Model)
+	if cmd != nil {
+		t.Fatal("cancelling bulk confirm should not fire a command")
+	}
+	if len(dropped) != 0 {
+		t.Fatalf("cancel still dropped %v", dropped)
+	}
+	if m.selectionCount() != 3 {
+		t.Errorf("cancel cleared the selection; count=%d, want 3", m.selectionCount())
+	}
+}
+
+// With no selection, single-item drop behaviour is unchanged: 'd' opens the
+// single-stash confirm, not the bulk one.
+func TestDropSingleItemUnchangedWithoutSelection(t *testing.T) {
+	var dropped []string
+	actions := Actions{Drop: recordingAction(&dropped, nil), Reload: reloadReturning(nil, nil)}
+	m := New(sampleStashes(), stubShow, newFakeStore(), actions, fixedNow, 0, nil)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m = updated.(Model)
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	m = updated.(Model)
+	if m.bulkConfirm {
+		t.Fatal("'d' with no selection opened the bulk confirm")
+	}
+	if !m.confirming {
+		t.Fatal("'d' with no selection should open the single-item confirm")
+	}
+}
