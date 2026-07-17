@@ -102,6 +102,7 @@ stash-stash --tag wip --tag hotfix  # AND: stashes carrying *both* tags
 stash-stash --stale-days 7   # flag anything older than a week as dusty
 stash-stash --stale-days 0   # disable the staleness nag entirely
 stash-stash --json | jq .    # machine-readable list for scripting
+stash-stash --all-repos ~/code  # dusty-stash dashboard across every repo under a dir
 ```
 
 ### Interactive TUI
@@ -238,6 +239,38 @@ stash-stash --json --tag experiment | jq '.stashes[].sha'
 `--tag` is repeatable and applies to both the plain table and `--json`. Every
 `--json` stash object carries a `tags` array (an empty `[]` when untagged), so
 consumers can filter or group without a nil check.
+
+### Cross-repo dusty-stash dashboard (`--all-repos`)
+
+The stashes you *actually* forgot aren't in the repo you're sitting in — they're
+in the one you haven't opened in a month. `--all-repos <dir>` walks a directory
+tree, finds every git repo under it, and prints **one combined dashboard** of
+all their stashes, sorted **oldest-first** so the dustiest work floats to the
+top:
+
+```console
+$ stash-stash --all-repos ~/code
+🧹 2 stashes are gathering dust across 4 repos (older than 14d) — triage them?
+AGE    REPO         INDEX      LABEL              BRANCH  CHANGES
+38d*   web/api      stash@{1}  payments: retry ~  main    +42 -3 · 2 files
+21d*   dotfiles     stash@{0}  wip: zsh tweaks    main    +8 -1 · 1 file
+2d     web/api      stash@{0}  fix modal          main    +12 -0 · 1 file
+
+(* = stale: older than 14d)
+```
+
+Each row keeps its full context — sidecar label/tags/note, age, origin branch,
+and diffstat — plus a `REPO` column (shown relative to the scan root). The scan
+is **read-only**: it never opens the TUI and never mutates anything. It skips
+common dependency/build dirs (`node_modules`, `vendor`, `target`, …) and won't
+descend into a repo's own tree.
+
+Honors `--stale-days` for the dust banner and `*` markers, and `--json` for a
+scriptable, per-repo document with machine-wide totals:
+
+```console
+$ stash-stash --all-repos ~/code --json | jq '.dusty_count, .repos[].repo'
+```
 
 ### Notes — capture the *why*
 

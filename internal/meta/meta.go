@@ -103,6 +103,39 @@ func Load(ctx context.Context) (*Store, error) {
 	return loadFrom(filepath.Join(gitDir, fileName))
 }
 
+// LoadIn reads the sidecar for the repository at dir (rather than the current
+// working directory), for the cross-repo dashboard (issue #33). It resolves
+// that repo's git directory via `git -C dir rev-parse --absolute-git-dir` and
+// otherwise behaves exactly like Load: a missing file yields an empty,
+// ready-to-use Store, and a non-repo dir returns ErrNotARepo.
+func LoadIn(ctx context.Context, dir string) (*Store, error) {
+	gitDir, err := gitDirInFunc(ctx, dir)
+	if err != nil {
+		return nil, err
+	}
+	return loadFrom(filepath.Join(gitDir, fileName))
+}
+
+// gitDirInFunc resolves the git directory for an arbitrary repo path via
+// `git -C dir rev-parse --absolute-git-dir`. It is a package var so tests can
+// stub it without real repositories on disk.
+var gitDirInFunc = func(ctx context.Context, dir string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "rev-parse", "--absolute-git-dir")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if isNotARepo(stderr.Bytes()) {
+			return "", ErrNotARepo
+		}
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", fmt.Errorf("git -C %s rev-parse --absolute-git-dir: %s", dir, msg)
+		}
+		return "", fmt.Errorf("git -C %s rev-parse --absolute-git-dir: %w", dir, err)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
 // loadFrom is the path-explicit core of Load, factored out for testing.
 func loadFrom(path string) (*Store, error) {
 	s := &Store{Version: schemaVersion, Entries: map[string]Entry{}, path: path}

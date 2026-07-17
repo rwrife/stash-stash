@@ -19,6 +19,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -88,6 +89,10 @@ var (
 	gitShow  = git.Show
 	gitCheck = git.WouldConflict
 
+	// Cross-repo dashboard (issue #33) indirection, so runAllRepos can be
+	// unit-tested without real repositories on disk.
+	gitScanRepos = git.ScanRepos
+
 	// Doctor (issue #10) indirections, so runDoctor can be unit-tested without a
 	// real repo, dangling commits, or sidecar file.
 	gitDangling   = git.DanglingStashes
@@ -134,13 +139,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "stash-stash %s — a concierge for your git stash graveyard.\n\n", version)
-		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n  stash-stash note <stash-ref> [-m \"text\"]\n  stash-stash check <stash-ref>\n  stash-stash compost [--stale-days N] [--list] [--restore <id>]\n  stash-stash doctor [--dry-run]\n\nFlags:\n")
+		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash --all-repos <dir>\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n  stash-stash note <stash-ref> [-m \"text\"]\n  stash-stash check <stash-ref>\n  stash-stash compost [--stale-days N] [--list] [--restore <id>]\n  stash-stash doctor [--dry-run]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	showVersion := fs.Bool("version", false, "print version and exit")
 	fs.BoolVar(&noTUIFlag, "no-tui", false, "force plain table output even on a TTY")
 	staleDays := fs.Int("stale-days", defaultStaleDays, "flag stashes older than this many days as gathering dust (0 disables)")
 	jsonOut := fs.Bool("json", false, "print the stash list as JSON for scripting (implies --no-tui)")
+	allRepos := fs.String("all-repos", "", "scan every git repo under this directory and show a combined dusty-stash dashboard")
 	var tagFilter stringSlice
 	fs.Var(&tagFilter, "tag", "only show stashes carrying this tag; repeatable for AND (e.g. --tag wip --tag hotfix)")
 
@@ -160,6 +166,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if *staleDays < 0 {
 		fmt.Fprintln(stderr, "stash-stash: --stale-days must be >= 0 (0 disables the staleness nag).")
 		return 2
+	}
+
+	// Cross-repo dashboard (issue #33): scan every repo under the given root and
+	// show one combined, staleness-sorted list. It is read-only and never opens
+	// the interactive TUI.
+	if *allRepos != "" {
+		return runAllRepos(stdout, stderr, *allRepos, *staleDays, *jsonOut)
 	}
 
 	return listOrBrowse(stdout, stderr, *staleDays, *jsonOut, tagFilter)
@@ -282,6 +295,92 @@ func listOrBrowse(stdout, stderr io.Writer, staleDays int, jsonOut bool, tagFilt
 		return 1
 	}
 	return 0
+}
+
+// runAllRepos implements `stash-stash --all-repos <dir>` (issue #33): it
+// discovers every git repo under root, lists each one's stashes, enriches them
+// with sidecar metadata + diffstats, and prints one combined dashboard sorted
+// oldest-first so the dustiest stashes across your whole machine float to the
+// top. It is read-only and never opens the interactive TUI. With --json it
+// emits a per-repo document instead. staleDays drives the dust banner and stale
+// markers (0 disables).
+//
+// It returns 0 on success (including "no dusty stashes anywhere"), 1 when root
+// itself can't be scanned. Per-repo listing/metadata errors are best-effort and
+// never abort the whole dashboard.
+func runAllRepos(stdout, stderr io.Writer, root string, staleDays int, jsonOut bool) int {
+	ctx := context.Background()
+
+	scanned, err := gitScanRepos(ctx, root)
+	if err != nil {
+		fmt.Fprintf(stderr, "stash-stash: %v\n", err)
+		return 1
+	}
+
+	absRoot, aerr := filepath.Abs(root)
+	if aerr != nil {
+		absRoot = root
+	}
+
+	renderGroups := make([]render.RepoGroup, 0, len(scanned))
+	jsonGroups := make([]jsonout.RepoGroup, 0, len(scanned))
+	for i := range scanned {
+		repo := scanned[i].Repo
+		stashes := scanned[i].Stashes
+
+		// Enrich per-repo metadata (labels/tags/notes) keyed by SHA. Best-effort:
+		// a sidecar problem in one repo just means label-less rows for it, never a
+		// failed dashboard.
+		applyRepoMeta(ctx, repo, stashes, stderr)
+		git.EnrichDiffstatsIn(ctx, repo, stashes)
+
+		// Show a path relative to the scan root when possible ("web/api" reads
+		// better than a long absolute path); fall back to the absolute path.
+		display := repo
+		if rel, rerr := filepath.Rel(absRoot, repo); rerr == nil && !strings.HasPrefix(rel, "..") {
+			display = rel
+		}
+
+		renderGroups = append(renderGroups, render.RepoGroup{Repo: display, Stashes: stashes})
+		jsonGroups = append(jsonGroups, jsonout.RepoGroup{Repo: display, Stashes: stashes})
+	}
+
+	if jsonOut {
+		if err := jsonout.WriteCrossRepo(stdout, jsonGroups, now(), staleDays); err != nil {
+			fmt.Fprintf(stderr, "stash-stash: encoding json: %v\n", err)
+			return 1
+		}
+		return 0
+	}
+
+	if err := render.CrossRepoTable(stdout, renderGroups, now(), staleDays); err != nil {
+		fmt.Fprintf(stderr, "stash-stash: rendering dashboard: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// applyRepoMeta loads the sidecar store for a specific repo and applies stored
+// labels/tags/notes onto its stashes by content SHA. It is the cross-repo
+// analogue of loadAndApplyMeta but scoped to one repo dir; on any load error it
+// reports to stderr and leaves the stashes label-less rather than failing.
+func applyRepoMeta(ctx context.Context, repo string, stashes []model.Stash, stderr io.Writer) {
+	store, err := meta.LoadIn(ctx, repo)
+	if err != nil {
+		fmt.Fprintf(stderr, "stash-stash: sidecar metadata unavailable for %s (%v); continuing without labels.\n", repo, err)
+		return
+	}
+	for i := range stashes {
+		if label, ok := store.Label(stashes[i].SHA); ok {
+			stashes[i].Label = label
+		}
+		if tags := store.Tags(stashes[i].SHA); len(tags) > 0 {
+			stashes[i].Tags = tags
+		}
+		if note, ok := store.Note(stashes[i].SHA); ok {
+			stashes[i].Note = note
+		}
+	}
 }
 
 // loadAndApplyMeta loads the sidecar store, applies any stored labels onto the
