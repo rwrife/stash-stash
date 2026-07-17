@@ -40,6 +40,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/rwrife/stash-stash/internal/age"
+	"github.com/rwrife/stash-stash/internal/fuzzy"
 	"github.com/rwrife/stash-stash/internal/git"
 	"github.com/rwrife/stash-stash/internal/meta"
 	"github.com/rwrife/stash-stash/internal/model"
@@ -358,6 +359,16 @@ type Model struct {
 	filtering  bool
 	filterTags []string
 
+	// --- issue #29: live fuzzy filter-as-you-type ---
+	// fuzzing is true while the live text-filter prompt is open. Unlike the tag
+	// filter (which commits on Enter), this filter is applied on every keystroke
+	// so the list narrows in real time. filterText holds the current query; when
+	// non-empty, only stashes whose label/branch/tags/note fuzzily match the query
+	// are shown, in addition to any active tag filter (AND). Esc clears it; Enter
+	// commits it and returns focus to navigation while keeping the narrowed view.
+	fuzzing    bool
+	filterText string
+
 	// --- issue #9: stash -> branch ---
 	// branching is true while the inline branch-name editor is open. It shares
 	// the `input` field with the label editor but commits to a different action
@@ -433,16 +444,36 @@ func (m Model) Init() tea.Cmd {
 // preview always track what the user can see. The returned slice is a fresh
 // slice header (its elements alias m.stashes) so reads are cheap and safe.
 func (m Model) visible() []model.Stash {
-	if len(m.filterTags) == 0 {
+	if len(m.filterTags) == 0 && strings.TrimSpace(m.filterText) == "" {
 		return m.stashes
 	}
 	out := make([]model.Stash, 0, len(m.stashes))
 	for i := range m.stashes {
-		if m.stashes[i].HasAllTags(m.filterTags) {
-			out = append(out, m.stashes[i])
+		if !m.stashes[i].HasAllTags(m.filterTags) {
+			continue
 		}
+		if !m.matchesFuzzy(m.stashes[i]) {
+			continue
+		}
+		out = append(out, m.stashes[i])
 	}
 	return out
+}
+
+// matchesFuzzy reports whether s satisfies the active live text filter. An
+// empty query matches everything (so the fuzzy filter is a no-op until the user
+// types). The query is matched as a case-insensitive subsequence against the
+// stash's display label, origin branch, each tag, and note text — a hit in any
+// field keeps the row (issue #29).
+func (m Model) matchesFuzzy(s model.Stash) bool {
+	q := strings.TrimSpace(m.filterText)
+	if q == "" {
+		return true
+	}
+	targets := make([]string, 0, 4+len(s.Tags))
+	targets = append(targets, s.Display(), s.Branch, s.Note)
+	targets = append(targets, s.Tags...)
+	return fuzzy.MatchAny(q, targets...)
 }
 
 // selected returns the visible stash under the cursor and true, or a zero
@@ -551,6 +582,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.filtering {
 		return m.handleFilterKey(msg)
 	}
+	if m.fuzzing {
+		return m.handleFuzzyKey(msg)
+	}
 	if m.branching {
 		return m.handleBranchKey(msg)
 	}
@@ -593,7 +627,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.beginNote()
 	case "b":
 		return m.beginBranch()
-	case "/", "f":
+	case "/":
+		return m.beginFuzzy()
+	case "f":
 		return m.beginFilter()
 
 	case "a":
@@ -928,6 +964,96 @@ func (m Model) refilter() tea.Cmd {
 			m.viewport.GotoTop()
 		}
 		return nil
+	}
+	m.loadedFor = -1
+	m.loading = true
+	if m.ready {
+		m.viewport.SetContent(dimStyle.Render("Loading diff…"))
+		m.viewport.GotoTop()
+	}
+	return m.loadDiffCmd(m.cursor)
+}
+
+// beginFuzzy opens the live fuzzy filter-as-you-type prompt (issue #29), seeded
+// with the current query so re-opening resumes where it left off. Unlike the
+// tag filter, this narrows the list on every keystroke; Enter commits and
+// returns to navigation, Esc clears it. It needs no sidecar store — it only
+// reads fields already loaded onto the stashes.
+func (m Model) beginFuzzy() (tea.Model, tea.Cmd) {
+	ti := textinput.New()
+	ti.Prompt = ""
+	ti.CharLimit = 120
+	ti.Placeholder = "type to filter…"
+	ti.SetValue(m.filterText)
+	ti.CursorEnd()
+	ti.Width = m.listInnerW
+	if ti.Width < 8 {
+		ti.Width = 8
+	}
+	ti.Focus()
+	m.input = ti
+	m.fuzzing = true
+	m.notice = ""
+	return m, textinput.Blink
+}
+
+// handleFuzzyKey drives the live fuzzy filter. Enter commits the query and
+// returns focus to navigation (keeping the narrowed view); Esc clears the
+// filter entirely and restores the full list; every other key edits the field
+// and immediately re-applies the filter so the list narrows in real time, with
+// the cursor kept on a valid visible row.
+func (m Model) handleFuzzyKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		m.fuzzing = false
+		if strings.TrimSpace(m.filterText) == "" {
+			m.notice = "filter cleared"
+		} else {
+			m.notice = "filtering: " + strings.TrimSpace(m.filterText)
+		}
+		return m, nil
+	case tea.KeyEsc, tea.KeyCtrlC:
+		m.fuzzing = false
+		hadFilter := strings.TrimSpace(m.filterText) != ""
+		m.filterText = ""
+		if hadFilter {
+			m.notice = "filter cleared"
+			return m, m.reclampAfterFuzzy()
+		}
+		m.notice = ""
+		return m, nil
+	}
+	// Any other key edits the field; re-apply live.
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	m.filterText = m.input.Value()
+	reclamp := m.reclampAfterFuzzy()
+	return m, tea.Batch(cmd, reclamp)
+}
+
+// reclampAfterFuzzy keeps the cursor on a valid visible row after the live
+// filter changed the visible set, and (re)loads the newly-selected stash's
+// diff. When the filter matches nothing it clears the preview to an explanatory
+// note rather than leaving a stale diff on screen. It never lets the cursor
+// land on a filtered-out row.
+func (m *Model) reclampAfterFuzzy() tea.Cmd {
+	v := m.visible()
+	if len(v) == 0 {
+		m.cursor = 0
+		m.loadedFor = -1
+		m.currentDiff = ""
+		m.loading = false
+		if m.ready {
+			m.viewport.SetContent(dimStyle.Render("No stashes match this filter. Keep typing, or press esc to clear."))
+			m.viewport.GotoTop()
+		}
+		return nil
+	}
+	if m.cursor > len(v)-1 {
+		m.cursor = len(v) - 1
+	}
+	if m.cursor < 0 {
+		m.cursor = 0
 	}
 	m.loadedFor = -1
 	m.loading = true
@@ -1703,6 +1829,12 @@ func (m Model) View() string {
 			filterStyle.Render("filter: "+render.FormatTags(m.filterTags)))
 	}
 
+	// Issue #29: reflect an active live text filter in the title row too.
+	if q := strings.TrimSpace(m.filterText); q != "" {
+		title = lipgloss.JoinHorizontal(lipgloss.Top, title,
+			filterStyle.Render("/"+q))
+	}
+
 	// Issue #28: reflect an active multi-selection in the title row.
 	if n := m.selectionCount(); n > 0 {
 		title = lipgloss.JoinHorizontal(lipgloss.Top, title,
@@ -1728,7 +1860,7 @@ func (m Model) View() string {
 // showing "<visible> of <total>" so the user knows the list is narrowed.
 func (m Model) titleText() string {
 	total := len(m.stashes)
-	if len(m.filterTags) == 0 {
+	if len(m.filterTags) == 0 && strings.TrimSpace(m.filterText) == "" {
 		return fmt.Sprintf("🪦 stash-stash — %d %s", total, plural(total, "stash", "stashes"))
 	}
 	shown := len(m.visible())
@@ -1767,6 +1899,11 @@ func (m Model) footer() string {
 	if m.filtering {
 		return editPromptStyle.Render("filter by tag: ") + m.input.View() +
 			helpStyle.Render("  comma-separated (AND) · ⏎ apply · esc cancel")
+	}
+	if m.fuzzing {
+		shown := len(m.visible())
+		return editPromptStyle.Render("/") + m.input.View() +
+			helpStyle.Render(fmt.Sprintf("  %d match · ⏎ keep · esc clear", shown))
 	}
 	if m.branching {
 		label := "branch"
@@ -1831,13 +1968,17 @@ func (m Model) footer() string {
 		return helpStyle.Render(m.notice)
 	}
 	filterHint := "/ filter"
-	if len(m.filterTags) > 0 {
+	if strings.TrimSpace(m.filterText) != "" {
 		filterHint = "/ filter*"
+	}
+	tagHint := "f tags"
+	if len(m.filterTags) > 0 {
+		tagHint = "f tags*"
 	}
 	if m.selectionCount() > 0 {
 		return helpStyle.Render(fmt.Sprintf("%d selected · space toggle · A all · N none · d drop selected · q quit", m.selectionCount()))
 	}
-	return helpStyle.Render("↑/↓ select · space mark · l label · t tags · n note · " + filterHint + " · b branch · a apply · p pop · d drop · c compost · q quit")
+	return helpStyle.Render("↑/↓ select · space mark · l label · t tags · n note · " + filterHint + " · " + tagHint + " · b branch · a apply · p pop · d drop · c compost · q quit")
 }
 
 // renderList draws the visible (filtered) stash rows, highlighting the cursor
@@ -1845,6 +1986,9 @@ func (m Model) footer() string {
 func (m Model) renderList() string {
 	v := m.visible()
 	if len(v) == 0 {
+		if q := strings.TrimSpace(m.filterText); q != "" {
+			return dimStyle.Render("(no stashes match /" + q + ")")
+		}
 		if len(m.filterTags) > 0 {
 			return dimStyle.Render("(no stashes match #" + strings.Join(m.filterTags, " #") + ")")
 		}
