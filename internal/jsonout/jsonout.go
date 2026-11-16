@@ -121,6 +121,101 @@ func Write(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) err
 	return enc.Encode(out)
 }
 
+// RepoGroup pairs a repository path with its stashes for the cross-repo JSON
+// output (issue #33). It mirrors the render layer's grouping so the CLI can
+// hand the same data to either renderer.
+type RepoGroup struct {
+	Repo    string
+	Stashes []model.Stash
+}
+
+// RepoOutput is one repo's entry in the cross-repo JSON document: its path plus
+// the same per-stash shapes the single-repo output uses.
+type RepoOutput struct {
+	Repo       string  `json:"repo"`
+	Count      int     `json:"count"`
+	DustyCount int     `json:"dusty_count"`
+	Stashes    []Stash `json:"stashes"`
+}
+
+// CrossRepoOutput is the top-level document for `--all-repos --json`: the active
+// threshold, machine-wide totals, and per-repo groups (each with its own
+// stashes). Repos are emitted in the order given (the CLI sorts by path).
+type CrossRepoOutput struct {
+	StaleDays  int          `json:"stale_days"`
+	RepoCount  int          `json:"repo_count"`
+	Count      int          `json:"count"`
+	DustyCount int          `json:"dusty_count"`
+	Repos      []RepoOutput `json:"repos"`
+}
+
+// WriteCrossRepo renders a multi-repo dashboard as indented JSON to w. Each
+// group's stashes are encoded exactly like the single-repo output; top-level
+// totals aggregate across every repo so a script can gate on machine-wide dust
+// without re-summing. now/staleDays drive age + staleness as elsewhere.
+func WriteCrossRepo(w io.Writer, groups []RepoGroup, now time.Time, staleDays int) error {
+	out := CrossRepoOutput{
+		StaleDays: staleDays,
+		RepoCount: len(groups),
+		Repos:     make([]RepoOutput, 0, len(groups)),
+	}
+	for _, g := range groups {
+		ro := RepoOutput{Repo: g.Repo, Count: len(g.Stashes), Stashes: make([]Stash, 0, len(g.Stashes))}
+		for _, s := range g.Stashes {
+			js := encodeStash(s, now, staleDays)
+			if js.Stale {
+				ro.DustyCount++
+				out.DustyCount++
+			}
+			out.Count++
+			ro.Stashes = append(ro.Stashes, js)
+		}
+		out.Repos = append(out.Repos, ro)
+	}
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	return enc.Encode(out)
+}
+
+// encodeStash builds the JSON shape for a single stash, shared by the
+// single-repo Write and the cross-repo WriteCrossRepo so the per-stash schema
+// stays identical across both.
+func encodeStash(s model.Stash, now time.Time, staleDays int) Stash {
+	bucket := age.Classify(s.Created, now, staleDays)
+	ageSecs := int64(0)
+	if !s.Created.IsZero() {
+		if d := now.Sub(s.Created); d > 0 {
+			ageSecs = int64(d.Seconds())
+		}
+	}
+	display, srcKind := s.DisplaySource()
+	return Stash{
+		Index:       s.Index,
+		Ref:         s.Ref(),
+		SHA:         s.SHA,
+		Label:       s.Label,
+		AutoLabel:   s.AutoLabel(),
+		Tags:        jsonTags(s.Tags),
+		Note:        s.Note,
+		Display:     display,
+		LabelSource: srcKind.String(),
+		Subject:     s.Subject,
+		Branch:      s.Branch,
+		TopFile:     s.TopFile,
+		Created:     s.Created.UTC(),
+		Age:         age.Humanize(s.Created, now),
+		AgeSeconds:  ageSecs,
+		Staleness:   bucket.String(),
+		Stale:       bucket.Dusty(),
+		Diffstat: Diffstat{
+			Added:   s.Diffstat.Added,
+			Deleted: s.Diffstat.Deleted,
+			Files:   s.Diffstat.Files,
+			Binary:  s.Diffstat.Binary,
+		},
+	}
+}
+
 // jsonTags returns tags as a non-nil slice so the JSON renders "[]" rather than
 // "null" for a stash with no tags, keeping the wire shape stable for scripts
 // that index `.tags[]` unconditionally.

@@ -10,6 +10,7 @@ package render
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -118,6 +119,119 @@ func Table(w io.Writer, stashes []model.Stash, now time.Time, staleDays int) err
 	// Legends only when we actually flagged something, so clean output stays
 	// uncluttered. Staleness and auto-label legends are independent.
 	if banner != "" {
+		if _, err := fmt.Fprintf(w, "\n(* = stale: older than %dd)\n", staleDays); err != nil {
+			return err
+		}
+	}
+	if sawAuto {
+		if _, err := fmt.Fprintln(w, "(~ = auto-label from branch + top file; run `stash-stash push -m` or `l` to name it)"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RepoGroup pairs a repository path with its stashes for the cross-repo
+// dashboard (issue #33). Repo is the display path (relative to the scan root
+// when possible); Stashes is that repo's list, most-recent first.
+type RepoGroup struct {
+	// Repo is the repository path shown in the dashboard's REPO column.
+	Repo string
+	// Stashes are the repo's stashes, most-recent first.
+	Stashes []model.Stash
+}
+
+// CrossRepoTable writes a combined, staleness-sorted dashboard of stashes drawn
+// from multiple repositories (issue #33). Rows are sorted oldest-first (dustiest
+// at the top — the whole point of a cross-repo triage view), with a REPO column
+// identifying each stash's home. When staleDays > 0 it prints a combined
+// "gathering dust" banner counting dusty stashes across all repos and flags
+// stale rows with a trailing "*" on the age token.
+//
+// Columns: AGE | REPO | INDEX | LABEL | BRANCH | CHANGES. An empty groups slice
+// prints a friendly "nothing dusty" line.
+func CrossRepoTable(w io.Writer, groups []RepoGroup, now time.Time, staleDays int) error {
+	// Flatten into (repo, stash) rows so we can sort globally by age.
+	type row struct {
+		repo  string
+		stash model.Stash
+	}
+	var rows []row
+	dusty := 0
+	for _, g := range groups {
+		for _, s := range g.Stashes {
+			rows = append(rows, row{repo: g.Repo, stash: s})
+			if staleDays > 0 && age.Classify(s.Created, now, staleDays).Dusty() {
+				dusty++
+			}
+		}
+	}
+
+	if len(rows) == 0 {
+		_, err := fmt.Fprintln(w, "No stashes found across the scanned repos. Your machine is tidy. 🧹")
+		return err
+	}
+
+	// Oldest first: dustiest stashes float to the top of the dashboard. A stash
+	// with a zero Created time (unknown age) sorts last so real ages lead.
+	sort.SliceStable(rows, func(i, j int) bool {
+		ci, cj := rows[i].stash.Created, rows[j].stash.Created
+		if ci.IsZero() != cj.IsZero() {
+			return !ci.IsZero() // known ages before unknown
+		}
+		return ci.Before(cj)
+	})
+
+	if staleDays > 0 && dusty > 0 {
+		noun := "stash is"
+		if dusty != 1 {
+			noun = "stashes are"
+		}
+		if _, err := fmt.Fprintf(w, "\U0001F9F9 %d %s gathering dust across %d repo%s (older than %dd) \u2014 triage them?\n",
+			dusty, noun, len(groups), plural(len(groups), "", "s"), staleDays); err != nil {
+			return err
+		}
+	}
+
+	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+	if _, err := fmt.Fprintln(tw, "AGE\tREPO\tINDEX\tLABEL\tBRANCH\tCHANGES"); err != nil {
+		return err
+	}
+
+	sawAuto := false
+	for _, r := range rows {
+		s := r.stash
+		branch := s.Branch
+		if branch == "" {
+			branch = "-"
+		}
+		changes := s.Diffstat.String()
+		if changes == "" {
+			changes = "-"
+		}
+		ageTok := age.Humanize(s.Created, now)
+		if staleDays > 0 && age.Classify(s.Created, now, staleDays).Dusty() {
+			ageTok += "*"
+		}
+		label, src := s.DisplaySource()
+		label = truncate(label, maxLabelWidth)
+		if src == model.LabelAuto {
+			sawAuto = true
+			label += " ~"
+		}
+		if tags := FormatTags(s.Tags); tags != "" {
+			label += "  " + tags
+		}
+		if _, err := fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			ageTok, r.repo, "stash@{"+strconv.Itoa(s.Index)+"}", label, branch, changes); err != nil {
+			return err
+		}
+	}
+	if err := tw.Flush(); err != nil {
+		return err
+	}
+
+	if staleDays > 0 && dusty > 0 {
 		if _, err := fmt.Fprintf(w, "\n(* = stale: older than %dd)\n", staleDays); err != nil {
 			return err
 		}
