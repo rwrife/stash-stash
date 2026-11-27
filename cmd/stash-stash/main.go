@@ -31,6 +31,7 @@ import (
 	"github.com/rwrife/stash-stash/internal/model"
 	"github.com/rwrife/stash-stash/internal/render"
 	"github.com/rwrife/stash-stash/internal/search"
+	"github.com/rwrife/stash-stash/internal/theme"
 	"github.com/rwrife/stash-stash/internal/tui"
 )
 
@@ -83,11 +84,12 @@ const defaultStaleDays = 14
 // implementations. gitList and gitShow are indirected likewise for the search
 // subcommand (which lists stashes and reads each one's patch).
 var (
-	gitPush  = git.Push
-	metaLoad = meta.Load
-	gitList  = git.List
-	gitShow  = git.Show
-	gitCheck = git.WouldConflict
+	gitPush     = git.Push
+	metaLoad    = meta.Load
+	gitList     = git.List
+	gitShow     = git.Show
+	gitCheck    = git.WouldConflict
+	setTUITheme = tui.SetTheme
 
 	// Cross-repo dashboard (issue #33) indirection, so runAllRepos can be
 	// unit-tested without real repositories on disk.
@@ -134,12 +136,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if len(args) > 0 && args[0] == "compost" {
 		return runCompost(args[1:], stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "export" {
+		return runExport(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "import" {
+		return runImport(args[1:], stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "hook" {
+		return runHook(args[1:], stdout, stderr)
+	}
 
 	fs := flag.NewFlagSet("stash-stash", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "stash-stash %s — a concierge for your git stash graveyard.\n\n", version)
-		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash --all-repos <dir>\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n  stash-stash note <stash-ref> [-m \"text\"]\n  stash-stash check <stash-ref>\n  stash-stash compost [--stale-days N] [--list] [--restore <id>]\n  stash-stash doctor [--dry-run]\n\nFlags:\n")
+		fmt.Fprintf(stderr, "Usage:\n  stash-stash [flags]\n  stash-stash --all-repos <dir>\n  stash-stash push [-m \"label\"]\n  stash-stash search <term> [--regex]\n  stash-stash note <stash-ref> [-m \"text\"]\n  stash-stash check <stash-ref>\n  stash-stash compost [--stale-days N] [--list] [--restore <id>]\n  stash-stash doctor [--dry-run]\n  stash-stash export [--out file]\n  stash-stash import <file> [--force]\n  stash-stash hook init [--shell bash|zsh]\n\nFlags:\n")
 		fs.PrintDefaults()
 	}
 	showVersion := fs.Bool("version", false, "print version and exit")
@@ -147,6 +158,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	staleDays := fs.Int("stale-days", defaultStaleDays, "flag stashes older than this many days as gathering dust (0 disables)")
 	jsonOut := fs.Bool("json", false, "print the stash list as JSON for scripting (implies --no-tui)")
 	allRepos := fs.String("all-repos", "", "scan every git repo under this directory and show a combined dusty-stash dashboard")
+	themeName := os.Getenv("STASH_STASH_THEME")
+	if themeName == "" {
+		themeName = "dark"
+	}
+	selectedTheme := fs.String("theme", themeName, "TUI color theme: dark, light, or high-contrast (default dark; STASH_STASH_THEME also works)")
 	var tagFilter stringSlice
 	fs.Var(&tagFilter, "tag", "only show stashes carrying this tag; repeatable for AND (e.g. --tag wip --tag hotfix)")
 
@@ -162,6 +178,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "stash-stash %s\n", version)
 		return 0
 	}
+
+	palette, err := theme.Resolve(*selectedTheme)
+	if err != nil {
+		fmt.Fprintf(stderr, "stash-stash: %v\n", err)
+		return 2
+	}
+	setTUITheme(palette)
 
 	if *staleDays < 0 {
 		fmt.Fprintln(stderr, "stash-stash: --stale-days must be >= 0 (0 disables the staleness nag).")

@@ -45,6 +45,7 @@ import (
 	"github.com/rwrife/stash-stash/internal/meta"
 	"github.com/rwrife/stash-stash/internal/model"
 	"github.com/rwrife/stash-stash/internal/render"
+	"github.com/rwrife/stash-stash/internal/theme"
 )
 
 // ShowFunc loads the patch for a stash ref (e.g. "stash@{0}"). It mirrors
@@ -118,88 +119,56 @@ const (
 )
 
 var (
-	titleStyle = lipgloss.NewStyle().Bold(true).Padding(0, 1)
-
-	listPaneStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("240")).
-			Padding(0, 1)
-
-	previewPaneStyle = lipgloss.NewStyle().
-				Border(lipgloss.RoundedBorder()).
-				BorderForeground(lipgloss.Color("240")).
-				Padding(0, 1)
-
-	selectedItemStyle = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(lipgloss.Color("231")).
-				Background(lipgloss.Color("63"))
-
-	itemStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
-
-	// selectMarkStyle tints the gutter marker shown on multi-selected rows
-	// (issue #28) so a batch selection is obvious at a glance, independent of the
-	// cursor highlight.
-	selectMarkStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212"))
-
-	// selectCountStyle frames the "N selected" badge in the title row, echoing
-	// the pink of the row markers so the batch selection reads as one feature.
-	selectCountStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("212")).Padding(0, 1)
-
-	dimStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-
-	branchStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("110"))
-
-	helpStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Padding(0, 1)
-
-	errStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("203"))
-
-	// labelStyle highlights a stored sidecar label so it reads as a real name
-	// rather than the raw git subject.
-	labelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("222"))
-
-	// autoLabelStyle renders an auto-derived label (issue #7) dim + italic so it
-	// is visibly a guess, not a name the user typed (which uses labelStyle).
-	autoLabelStyle = lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("245"))
-
-	// statStyle dims the diffstat token in the list.
-	statStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("108"))
-
-	// noteIndicatorStyle tints the 📝 marker shown in a list row when the stash
-	// carries a note (issue #22).
-	noteIndicatorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("180"))
-
-	// noteBlockStyle frames the stash's note at the top of the preview pane.
-	noteBlockStyle = lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("180"))
-
-	// editPromptStyle frames the inline label editor row.
-	editPromptStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Padding(0, 1)
-
-	// confirmStyle frames the destructive-action y/N prompt so it reads as a
-	// warning, not a casual hint.
-	confirmStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203")).Padding(0, 1)
-
-	// --- M6 staleness ---
-	// bannerStyle frames the "gathering dust" nag in the title row: amber on
-	// nothing, bold, so it reads as a gentle alert.
-	bannerStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214")).Padding(0, 1)
-
-	// tagStyle renders a stash row's compact "#tag" tokens: a cool teal so they
-	// read as metadata, distinct from the amber label and blue branch lines.
-	tagStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("79"))
-
-	// filterStyle frames the active tag filter in the title row, echoing the
-	// teal of the row tags so the connection is obvious.
-	filterStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("79")).Padding(0, 1)
-
-	// Age token colors by staleness bucket, applied to the age in each row.
-	// Fresh stays dim (no special attention), aging goes amber, stale orange,
-	// ancient red — a clear "the older, the hotter" ramp.
-	ageFreshStyle   = dimStyle
-	ageAgingStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("179"))            // soft amber
-	ageStaleStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))            // orange
-	ageAncientStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("203")) // red
+	titleStyle, listPaneStyle, previewPaneStyle lipgloss.Style
+	selectedItemStyle, itemStyle                lipgloss.Style
+	selectMarkStyle, selectCountStyle           lipgloss.Style
+	dimStyle, branchStyle, helpStyle, errStyle  lipgloss.Style
+	labelStyle, autoLabelStyle, statStyle       lipgloss.Style
+	noteIndicatorStyle, noteBlockStyle          lipgloss.Style
+	editPromptStyle, confirmStyle, bannerStyle  lipgloss.Style
+	tagStyle, filterStyle                       lipgloss.Style
+	ageFreshStyle, ageAgingStyle                lipgloss.Style
+	ageStaleStyle, ageAncientStyle              lipgloss.Style
+	diffAddStyle, diffDelStyle                  lipgloss.Style
+	diffHunkStyle, diffHeaderStyle              lipgloss.Style
 )
+
+func init() {
+	SetTheme(theme.Default())
+}
+
+// SetTheme configures the TUI palette before the single interactive model runs.
+func SetTheme(palette theme.Palette) {
+	titleStyle = lipgloss.NewStyle().Bold(true).Padding(0, 1)
+	listPaneStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(palette.Border).Padding(0, 1)
+	previewPaneStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(palette.Border).Padding(0, 1)
+	selectedItemStyle = lipgloss.NewStyle().Bold(true).Foreground(palette.SelectedForeground).Background(palette.SelectedBackground)
+	itemStyle = lipgloss.NewStyle().Foreground(palette.Text)
+	selectMarkStyle = lipgloss.NewStyle().Bold(true).Foreground(palette.Selection)
+	selectCountStyle = lipgloss.NewStyle().Bold(true).Foreground(palette.Selection).Padding(0, 1)
+	dimStyle = lipgloss.NewStyle().Foreground(palette.Muted)
+	branchStyle = lipgloss.NewStyle().Foreground(palette.Branch)
+	helpStyle = lipgloss.NewStyle().Foreground(palette.Help).Padding(0, 1)
+	errStyle = lipgloss.NewStyle().Foreground(palette.Error)
+	labelStyle = lipgloss.NewStyle().Foreground(palette.Label)
+	autoLabelStyle = lipgloss.NewStyle().Italic(true).Foreground(palette.AutoLabel)
+	statStyle = lipgloss.NewStyle().Foreground(palette.Stat)
+	noteIndicatorStyle = lipgloss.NewStyle().Foreground(palette.Note)
+	noteBlockStyle = lipgloss.NewStyle().Italic(true).Foreground(palette.Note)
+	editPromptStyle = lipgloss.NewStyle().Foreground(palette.Edit).Padding(0, 1)
+	confirmStyle = lipgloss.NewStyle().Bold(true).Foreground(palette.Confirm).Padding(0, 1)
+	bannerStyle = lipgloss.NewStyle().Bold(true).Foreground(palette.Banner).Padding(0, 1)
+	tagStyle = lipgloss.NewStyle().Foreground(palette.Tag)
+	filterStyle = lipgloss.NewStyle().Bold(true).Foreground(palette.Tag).Padding(0, 1)
+	ageFreshStyle = dimStyle
+	ageAgingStyle = lipgloss.NewStyle().Foreground(palette.AgeAging)
+	ageStaleStyle = lipgloss.NewStyle().Foreground(palette.AgeStale)
+	ageAncientStyle = lipgloss.NewStyle().Bold(true).Foreground(palette.AgeAncient)
+	diffAddStyle = lipgloss.NewStyle().Foreground(palette.DiffAdded)
+	diffDelStyle = lipgloss.NewStyle().Foreground(palette.DiffRemoved)
+	diffHunkStyle = lipgloss.NewStyle().Foreground(palette.DiffHunk)
+	diffHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(palette.DiffHeader)
+}
 
 // diffLoadedMsg carries the result of an asynchronous git.Show for a stash.
 // The index ties the result back to a row so a stale, slow load for a
