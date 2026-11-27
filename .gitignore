@@ -13,6 +13,7 @@ coverage.out
 # Editors / OS
 .vscode/
 .idea/
+.worktrees/
 .DS_Store
 *.swp
 

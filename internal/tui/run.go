@@ -8,7 +8,6 @@ import (
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/rwrife/stash-stash/internal/model"
 )
@@ -45,15 +44,6 @@ func truncate(s string, max int) string {
 	runes := []rune(s)
 	return string(runes[:max-1]) + "…"
 }
-
-// Diff line styles. Kept deliberately muted so the preview reads like a pager,
-// not a circus.
-var (
-	diffAddStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("78"))  // green
-	diffDelStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("203")) // red
-	diffHunkStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))  // cyan
-	diffHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("252"))
-)
 
 // colorizeDiff applies minimal syntax coloring to a unified diff for the
 // preview pane: additions green, deletions red, hunk headers cyan, and file

@@ -110,24 +110,14 @@ Key flows:
 6. **M6 — staleness nag + polish.** `--stale-days`, color buckets by age, header
    "gathering dust" banner, `--json` output for scripting, `go install` docs.
 
-## 8. Backlog / future features (v0.2+)
+## 8. Delivered post-MVP scope
 
-1. **Auto-labels from branch + first changed file** ("payments: fix retry").
-2. **`stash-stash search <term>`** — grep across all stash diffs at once.
-3. **Stash → branch** in one key (`b`): `git stash branch` with the saved label.
-4. **Expiry policy / "compost":** optionally auto-archive stashes older than N
-   days into a `refs/stash-stash/archive` instead of dropping them.
-5. **Conflict pre-flight:** before apply/pop, dry-run and warn if it'll conflict.
-6. **Tags & filtering:** tag stashes (`wip`, `experiment`, `hotfix`) and filter.
-7. **Cross-repo dashboard:** `stash-stash --all-repos ~/code` to find dusty
-   stashes across every repo you own.
-8. **Shell hook:** optional pre-checkout reminder if you're leaving dusty stashes.
-9. **Notes per stash:** multi-line note attached to a stash (the "why").
-10. **Export/import** the sidecar so teammates can share stash context (rare but
-    handy for handoffs).
-11. **`stash-stash doctor`** — detect orphaned metadata, dangling stash commits
-    recoverable via reflog ("found work you thought you lost").
-12. **Theming** via Lip Gloss profiles (light/dark/high-contrast).
+All originally listed follow-on items are implemented: auto-labels, stash
+search, stash-to-branch, compost/archive, conflict pre-flight, tags and
+filtering, the cross-repo dashboard, the optional shell reminder, notes,
+metadata export/import, `doctor` recovery, and dark/light/high-contrast themes.
+No planned backlog items remain. New ideas belong in GitHub issues rather than
+this completed roadmap.
 
 ## 9. Out of scope
 

@@ -26,16 +26,11 @@ that); it does *one* thing: the stash lifecycle, done well.
 
 ## Status
 
-🎉 **v0.1 — feature-complete.** All six milestones are in: read/list, an
-interactive TUI with diff preview, sidecar labels, apply/pop/drop, a labeled
-`push` wrapper, and the **staleness nag + `--json`** (M6). See
-[`PLAN.md`](./PLAN.md) and the
-[milestones](https://github.com/rwrife/stash-stash/issues?q=label%3Amilestone).
-
-**Beyond v0.1:** auto-labels (`<area>: <hint>` from the branch + top changed
-file), **`stash-stash search`** — grep across every stash's contents at once —
-and **`stash-stash doctor`** — recover stashes you thought you lost (reflog +
-`git fsck`) and clean up orphaned labels.
+🎉 **The planned feature backlog is complete.** The original v0.1 milestones
+and the follow-on features in [`PLAN.md`](./PLAN.md) are implemented, including
+stash recovery, conflict checks, cross-repository browsing, metadata handoff,
+accessible themes, and an optional shell reminder. Future ideas should be
+tracked as new issues rather than left in the completed roadmap.
 
 ## Install
 
@@ -103,6 +98,12 @@ stash-stash --stale-days 7   # flag anything older than a week as dusty
 stash-stash --stale-days 0   # disable the staleness nag entirely
 stash-stash --json | jq .    # machine-readable list for scripting
 stash-stash --all-repos ~/code  # dusty-stash dashboard across every repo under a dir
+stash-stash --theme light    # light TUI palette
+STASH_STASH_THEME=high-contrast stash-stash  # high-contrast TUI palette
+stash-stash export --out handoff.json  # portable labels, tags, and notes
+stash-stash import handoff.json       # merge matching local stash metadata
+stash-stash import handoff.json --force  # overwrite conflicting metadata
+eval "$(stash-stash hook init --shell bash)"  # optional checkout/switch reminder
 ```
 
 ### Interactive TUI
@@ -479,6 +480,40 @@ dusty rows get a `*` and a header banner. Tune it with `--stale-days N`, or pass
 `--stale-days 0` to silence the nag entirely. Ages ramp through buckets:
 *fresh* (< half the threshold) → *aging* → *stale* (≥ threshold) → *ancient*
 (≥ 2× threshold).
+
+### TUI themes
+
+The TUI supports three palettes: `dark` (the default), `light`, and
+`high-contrast`. Select one with `--theme`, or set `STASH_STASH_THEME` as
+your default; the command-line flag takes precedence. An unknown name reports
+the valid choices. Themes affect the interactive TUI; plain-table output stays
+unstyled.
+
+### Exporting and importing stash metadata
+
+The sidecar can be shared as stable, human-diffable JSON keyed by stash content
+SHA. Export to stdout or a file, then import into another clone:
+
+```bash
+stash-stash export > handoff.json
+stash-stash export --out handoff.json
+stash-stash import handoff.json
+stash-stash import handoff.json --force
+```
+
+Import applies metadata only for SHAs present in the local stash list and
+reports unknown SHAs. It fills missing labels and notes and unions tags; a
+conflicting non-empty label or note is skipped by default. Use `--force` to
+replace a conflicting entry with the imported metadata.
+
+### Optional shell reminder
+
+`stash-stash hook init` prints a Bash or Zsh snippet that wraps direct
+`git checkout` and `git switch` commands with a non-blocking stale-stash
+reminder. It changes no shell files; source it for the current shell or add
+`eval "$(stash-stash hook init --shell bash)"` to your Bash startup file.
+Use `--shell zsh` for Zsh. The reminder is quiet outside a repository and
+continues the Git command even if the check cannot run.
 
 ## Scripting with `--json`
 
